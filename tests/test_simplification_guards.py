@@ -60,7 +60,7 @@ def test_installed_statusline_helper_runs_on_stdlib_python(tmp_path, monkeypatch
 
 
 def test_statusline_compatibility_entrypoint_in_pool_root(tmp_path):
-    source = Path(watch.__file__).resolve().parents[2]
+    source = Path(__file__).resolve().parents[1]
     wrapper = tmp_path / "claude-statusline.py"
     shutil.copyfile(source / "claude-statusline.py", wrapper)
     (tmp_path / "current").symlink_to(source, target_is_directory=True)

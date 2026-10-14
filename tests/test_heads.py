@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,11 @@ class _FakeResult:
 
 
 class DispatchHeadTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = str(Path(temporary.name).resolve())
+
     def test_builds_request_and_maps_completed_result(self):
         seen: dict = {}
 
@@ -23,7 +29,7 @@ class DispatchHeadTests(unittest.TestCase):
             seen["_settings"] = settings
             return _FakeResult("completed", "did it", 1234)
 
-        head = dispatch_head("/root", {"k": "v"}, provider="codex", dispatch_fn=fake_dispatch)
+        head = dispatch_head(self.root, {"k": "v"}, provider="codex", dispatch_fn=fake_dispatch)
         result = head(Path("/tmp/wt"), "please fix the failing test")
 
         self.assertIsInstance(result, HeadResult)
@@ -35,7 +41,7 @@ class DispatchHeadTests(unittest.TestCase):
         self.assertEqual(seen["provider"], "codex")
         self.assertEqual(seen["prompt"], "please fix the failing test")
         self.assertEqual(seen["write_scope"], ["."])
-        self.assertEqual(seen["_root"], "/root")
+        self.assertEqual(seen["_root"], self.root)
         self.assertEqual(seen["_settings"], {"k": "v"})
 
     def test_model_and_effort_flow_into_the_request_when_set(self):
@@ -46,7 +52,7 @@ class DispatchHeadTests(unittest.TestCase):
             return _FakeResult("completed", "ok", 0)
 
         head = dispatch_head(
-            "/root", {}, provider="codex", model="gpt-5.6-sol", effort="high",
+            self.root, {}, provider="codex", model="gpt-5.6-sol", effort="high",
             dispatch_fn=fake_dispatch,
         )
         head(Path("/tmp/wt"), "p")
@@ -60,7 +66,7 @@ class DispatchHeadTests(unittest.TestCase):
             seen.update(request)
             return _FakeResult("completed", "ok", 0)
 
-        dispatch_head("/root", {}, provider="codex", mcp=("visual",), dispatch_fn=fake_dispatch)(
+        dispatch_head(self.root, {}, provider="codex", mcp=("visual",), dispatch_fn=fake_dispatch)(
             Path("/tmp/wt"), "p"
         )
         self.assertEqual(seen["mcp"], ["visual"])
@@ -72,7 +78,7 @@ class DispatchHeadTests(unittest.TestCase):
             seen.update(request)
             return _FakeResult("completed", "ok", 0)
 
-        dispatch_head("/root", {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
+        dispatch_head(self.root, {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
         self.assertNotIn("model", seen)
         self.assertNotIn("effort", seen)
 
@@ -80,7 +86,7 @@ class DispatchHeadTests(unittest.TestCase):
         def fake_dispatch(root, settings, request):
             return _FakeResult("reserved", "no capacity", 0)
 
-        head = dispatch_head("/root", {}, dispatch_fn=fake_dispatch)
+        head = dispatch_head(self.root, {}, dispatch_fn=fake_dispatch)
         result = head(Path("/tmp/wt"), "p")
         self.assertFalse(result.ok)
         self.assertEqual(result.summary, "no capacity")
@@ -89,7 +95,7 @@ class DispatchHeadTests(unittest.TestCase):
         def fake_dispatch(root, settings, request):
             return _FakeResult("completed", None, 0)
 
-        head = dispatch_head("/root", {}, dispatch_fn=fake_dispatch)
+        head = dispatch_head(self.root, {}, dispatch_fn=fake_dispatch)
         self.assertEqual(head(Path("/tmp/wt"), "p").summary, "completed")
 
     def test_goal_id_stamps_label_and_iteration_across_calls(self):
@@ -99,7 +105,7 @@ class DispatchHeadTests(unittest.TestCase):
             requests.append(dict(request))
             return _FakeResult("completed", "ok", 0)
 
-        head = dispatch_head("/root", {}, goal_id="g123", dispatch_fn=fake_dispatch)
+        head = dispatch_head(self.root, {}, goal_id="g123", dispatch_fn=fake_dispatch)
         head(Path("/tmp/wt"), "first")
         head(Path("/tmp/wt"), "second")
         self.assertEqual([r["goal_id"] for r in requests], ["g123", "g123"])
@@ -114,7 +120,7 @@ class DispatchHeadTests(unittest.TestCase):
             return _FakeResult("completed", "ok", 0)
 
         dispatch_head(
-            "/root", {}, protected_paths=("tools/codex_review.py", ".codex-seats/review.json"),
+            self.root, {}, protected_paths=("tools/codex_review.py", ".codex-seats/review.json"),
             dispatch_fn=fake_dispatch,
         )(Path("/tmp/wt"), "p")
         self.assertEqual(
@@ -128,7 +134,7 @@ class DispatchHeadTests(unittest.TestCase):
             seen.update(request)
             return _FakeResult("completed", "ok", 0)
 
-        dispatch_head("/root", {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
+        dispatch_head(self.root, {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
         self.assertNotIn("protected_paths", seen)
 
     def test_resolved_provider_flows_onto_the_result(self):
@@ -137,14 +143,14 @@ class DispatchHeadTests(unittest.TestCase):
         def fake_dispatch(root, settings, request):
             return _FakeResult("completed", "ok", 0, provider="codex")
 
-        head = dispatch_head("/root", {}, provider="auto", dispatch_fn=fake_dispatch)
+        head = dispatch_head(self.root, {}, provider="auto", dispatch_fn=fake_dispatch)
         self.assertEqual(head(Path("/tmp/wt"), "p").provider, "codex")
 
     def test_provider_defaults_to_empty_when_result_lacks_it(self):
         class _NoProvider:
             status, message, tokens = "completed", "ok", 0
 
-        head = dispatch_head("/root", {}, dispatch_fn=lambda *a: _NoProvider())
+        head = dispatch_head(self.root, {}, dispatch_fn=lambda *a: _NoProvider())
         self.assertEqual(head(Path("/tmp/wt"), "p").provider, "")
 
     def test_no_goal_id_means_no_trace_keys(self):
@@ -154,7 +160,7 @@ class DispatchHeadTests(unittest.TestCase):
             seen.update(request)
             return _FakeResult("completed", "ok", 0)
 
-        dispatch_head("/root", {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
+        dispatch_head(self.root, {}, dispatch_fn=fake_dispatch)(Path("/tmp/wt"), "p")
         for key in ("goal_id", "label", "iteration"):
             self.assertNotIn(key, seen)
 

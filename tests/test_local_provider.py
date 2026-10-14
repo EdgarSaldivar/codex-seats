@@ -175,12 +175,40 @@ def repository(tmp_path: Path) -> Path:
 
 def _run_ready(monkeypatch, root, settings, request):
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Fake Qwen inspects generated arguments/profiles; native containment has a
+    # separate macOS acceptance job. Keep these contract fixtures portable.
+    real_shutil = provider_local.shutil
+    monkeypatch.setattr(provider_local, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(provider_local, "shutil", SimpleNamespace(
+        which=lambda command: "/synthetic/sandbox-exec" if command == "sandbox-exec"
+        else real_shutil.which(command),
+        rmtree=real_shutil.rmtree,
+    ))
     monkeypatch.setattr(
         provider_local.local_seats,
         "probe_host",
         lambda *args, **kwargs: _ready(settings),
     )
     return provider_local.run_local(root, settings, request)
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_missing_native_sandbox_refuses_launch(tmp_path, repository, monkeypatch, platform):
+    root = tmp_path / "control"
+    root.mkdir(mode=0o700)
+    executable = _fake_qwen(tmp_path, _result_document())
+    settings = _settings(str(executable))
+    real_shutil = provider_local.shutil
+    monkeypatch.setattr(provider_local, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(provider_local, "shutil", SimpleNamespace(
+        which=lambda command: None if command == "sandbox-exec" else real_shutil.which(command),
+        rmtree=real_shutil.rmtree,
+    ))
+    monkeypatch.setattr(provider_local.local_seats, "probe_host", lambda *_args, **_kwargs: _ready(settings))
+    result = provider_local.run_local(root, settings, _request(repository))
+    assert result.status == "failed" and result.fallback_safe is True, result.message
+    assert "requires macOS sandbox-exec" in result.message
+    assert not (tmp_path / "capture.json").exists()
 
 
 def test_exact_argv_env_config_isolation_and_structured_usage(
