@@ -1,0 +1,76 @@
+{
+  "settings": {
+    "schema": 3,
+    "pool": {
+      "seats": {
+        "seat1": {
+          "label": "Premium",
+          "lifecycle": "active",
+          "home": null,
+          "capacity_profile": "business-premium",
+          "relative_capacity": 5.0,
+          "capacity_source": "openai-help-center",
+          "capacity_verified_at": "2026-09-03T00:00:00Z"
+        },
+        "seat2": {
+          "label": "Standard",
+          "lifecycle": "active",
+          "home": null,
+          "capacity_profile": "business-standard",
+          "relative_capacity": 1.0,
+          "capacity_source": "openai-help-center",
+          "capacity_verified_at": "2026-09-03T00:00:00Z"
+        }
+      },
+      "primary": "seat1",
+      "deputy": "seat2"
+    }
+  },
+  "status": {
+    "counts": {"healthy": 2, "active": 2},
+    "effective_codex_worker_slots": {"codex_primary_head": 1, "claude_head": 2},
+    "ceilings": {
+      "global_safety": 3,
+      "default_primary_codex_head": 2,
+      "claude_head": 2,
+      "conservative_mixed_origin": 2
+    },
+    "seats": {
+      "seat1": {
+        "label": "Premium",
+        "role": "primary",
+        "relative_capacity": 5.0,
+        "binding_available_baseline_units": 400.0,
+        "binding_usable_baseline_units": 400.0,
+        "profile_window_drift": false
+      },
+      "seat2": {
+        "label": "Standard",
+        "role": "deputy",
+        "relative_capacity": 1.0,
+        "binding_available_baseline_units": 80.0,
+        "binding_usable_baseline_units": 80.0,
+        "profile_window_drift": false
+      }
+    }
+  },
+  "dashboard_contains": [
+    "Seats ready 2/2",
+    "Premium",
+    "Standard",
+    "small + big"
+  ],
+  "segment_contains": [
+    "H:2/2",
+    "Premium(seat1)@5x",
+    "Standard(seat2)@1x",
+    "MAX:C2/D2/H2/S3"
+  ],
+  "resets_contains": [
+    "2 healthy / 2 active",
+    "Premium · business-premium",
+    "Standard · business-standard",
+    "available=400, usable=400",
+    "available=80, usable=80"
+  ]
+}

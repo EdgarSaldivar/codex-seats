@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="codex-seats-session" content="__SESSION_TOKEN__">
+  <title>codex-seats · Inventory</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<div id="codex-seats">
+  <div class="cs-window">
+    <header class="cs-topbar">
+      <div class="cs-brand"><span class="cs-mark" aria-hidden="true">&gt;_</span><span class="cs-logotype">codex-seats</span></div>
+      <nav class="cs-nav" aria-label="Application navigation">
+        <button id="nav-inventory" type="button" data-page="inventory" aria-current="page">Inventory</button>
+        <button id="nav-claude" type="button" data-page="claude">Claude</button>
+        <button id="nav-settings" type="button" data-page="settings">Settings</button>
+      </nav>
+    </header>
+    <div id="notifications" class="cs-notifications"></div>
+    <main id="content" class="cs-content"><p class="cs-loading">Reading cached state…</p></main>
+    <section id="operation" hidden aria-label="Action review"></section>
+    <footer class="cs-footer"><span id="connection">Connecting to the local manager</span><span>Local manager · cached observations</span></footer>
+  </div>
+  <div id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+  <noscript>Enable JavaScript to use this local interface. Terminal management remains available with codex-seat dash --manage.</noscript>
+</div>
+</body>
+</html>

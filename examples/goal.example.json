@@ -1,0 +1,18 @@
+{
+  "goal": "Describe the exact outcome the supervisor must deliver.",
+  "repo": "/absolute/path/to/repository",
+  "acceptance": [
+    "make test"
+  ],
+  "head": "auto",
+  "constraints": [
+    "Preserve unrelated changes."
+  ],
+  "max_iterations": 12,
+  "pause_after_failures": 3,
+  "link": [],
+  "protected": [],
+  "review": "",
+  "effort": "high",
+  "preset": false
+}

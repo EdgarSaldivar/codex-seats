@@ -1,0 +1,75 @@
+# Ignore everything unless it is explicitly identified below as source,
+# documentation, a test, or a sanitized example/template. Credentials and live
+# pool state must never become source artifacts.
+.broker/
+*
+
+!.gitignore
+!README.md
+!AGENTS.md
+!LICENSE
+!NOTICE
+!SECURITY.md
+!CONTRIBUTING.md
+!CHANGELOG.md
+!.seats-gates.json
+!pyproject.toml
+!uv.lock
+
+# Public repository metadata and CI definitions.
+!.github/
+!.github/ISSUE_TEMPLATE/
+!.github/ISSUE_TEMPLATE/*.md
+!.github/ISSUE_TEMPLATE/*.yml
+!.github/ISSUE_TEMPLATE/*.yaml
+!.github/PULL_REQUEST_TEMPLATE.md
+!.github/workflows/
+!.github/workflows/*.yml
+!.github/workflows/*.yaml
+
+# Executable entry points and hooks.
+!codex-seat
+!worker-hook
+!claude-statusline.py
+!bootstrap/
+!bootstrap/codex-seat
+!bootstrap/worker-hook
+
+# Python source.
+!lib/
+!lib/codex_seats/
+!lib/codex_seats/*.py
+!lib/codex_seats/ui/
+!lib/codex_seats/ui/*.html
+!lib/codex_seats/ui/*.css
+!lib/codex_seats/ui/*.js
+
+# Tests and deterministic fixtures.
+!tests/
+!tests/*.py
+!tests/fixtures/
+!tests/fixtures/*.json
+!tests/fixtures/dynamic_seat_registry/
+!tests/fixtures/dynamic_seat_registry/*.json
+!tests/fixtures/trusted-development/
+!tests/fixtures/trusted-development/**
+tests/fixtures/trusted-development/**/.build/
+tests/fixtures/trusted-development/**/.swiftpm/
+tests/fixtures/trusted-development/**/xcuserdata/
+
+
+# Sanitized examples and operator documentation.
+!examples/
+!examples/*.json
+!docs/
+!docs/**
+docs/reviews/
+!templates/
+!templates/**
+
+# Repository integrity checks.
+!scripts/
+!scripts/*.py
+
+.venv/
+.venv-dev/

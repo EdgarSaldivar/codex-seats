@@ -1,0 +1,10 @@
+{
+  "gates": [
+    "uv run --extra dev python scripts/check_subprocess_policy.py",
+    "uv run --extra dev ruff check .",
+    "uv run --extra dev python scripts/check_tracked_files.py",
+    "uv run --extra dev python scripts/check_likely_secrets.py",
+    "uv run --extra dev python -m pytest tests -q"
+  ],
+  "link": []
+}

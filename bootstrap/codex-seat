@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# codex-seats immutable bootstrap shim v1
+import sys
+
+# Checked before any other import so an old interpreter fails with a clear
+# message instead of a syntax or import error from release code.
+if sys.version_info < (3, 11):
+    sys.stderr.write(
+        "codex-seats bootstrap: Python 3.11 or newer is required, but "
+        + (sys.executable or "python3") + " is Python " + sys.version.split()[0]
+        + ". Put a Python 3.11+ python3 first on PATH for this shim.\n"
+    )
+    raise SystemExit(126)
+
+import os
+import re
+import runpy
+import stat
+from pathlib import Path
+
+RID = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def fail(message):
+    print("codex-seats bootstrap: " + message, file=sys.stderr)
+    raise SystemExit(126)
+
+
+def release(root, rid):
+    if not isinstance(rid, str) or not RID.fullmatch(rid):
+        fail("invalid release id")
+    releases = root / "releases"
+    selected = releases / rid
+    try:
+        releases_info = releases.lstat()
+        selected_info = selected.lstat()
+    except OSError as exc:
+        fail("release unavailable: " + str(exc))
+    if stat.S_ISLNK(releases_info.st_mode) or not stat.S_ISDIR(releases_info.st_mode):
+        fail("releases must be a real directory")
+    if stat.S_ISLNK(selected_info.st_mode) or not stat.S_ISDIR(selected_info.st_mode):
+        fail("release must be a real directory")
+    if selected.parent != releases or selected.name != rid:
+        fail("release escaped releases directory")
+    lib = selected / "lib"
+    package = lib / "codex_seats"
+    target = package / "cli.py"
+    for path in (lib, package):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail("release code path is not a real directory")
+        if path.parent not in (selected, lib):
+            fail("release code path escaped release")
+    if not target.is_file() or target.is_symlink():
+        fail("release entry module unavailable")
+    return lib
+
+
+root = Path(__file__).resolve(strict=True).parent
+current = root / "current"
+try:
+    if not stat.S_ISLNK(current.lstat().st_mode):
+        fail("current is not a symlink")
+    parts = Path(os.readlink(current)).parts
+except OSError as exc:
+    fail("current unavailable: " + str(exc))
+if len(parts) != 2 or parts[0] != "releases" or not RID.fullmatch(parts[1]):
+    fail("current must point directly to releases/<release-id>")
+rid = parts[1]
+lib = release(root, rid)
+os.environ["CODEX_SEATS_ROOT"] = str(root)
+os.environ["CODEX_SEATS_RELEASE_ID"] = rid
+os.environ.pop("PYTHONHOME", None)
+os.environ.pop("PYTHONPATH", None)
+sys.path[:] = [str(lib)] + [value for value in sys.path if value != str(root)]
+runpy.run_module("codex_seats.cli", run_name="__main__")

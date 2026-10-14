@@ -1,0 +1,145 @@
+{
+  "_comment": [
+    "Non-secret schema-3 example for ~/.codex-seats/settings.json.",
+    "Preview seat changes before applying them from a trusted interactive terminal.",
+    "Local seatN ids are stable local authenticated identities, not OpenAI paid-seat inventory.",
+    "No command here changes workspace billing or membership, revokes credentials, or deletes a seat home.",
+    "Local execution is opt-in; see docs/local-seats.md for probes, dispatch, and shared resource claims.",
+    "Adjust machine-local paths and projects; drop _comment keys if warning-free status is desired."
+  ],
+  "schema": 3,
+  "pool": {
+    "_comment": "Primary means default Codex head, not spend-last capacity. Active-head exclusion and explicit reserves provide protection; roles do not affect worker priority.",
+    "seats": {
+      "seat1": {
+        "label": "Premium",
+        "lifecycle": "active",
+        "home": "/Users/you/.codex",
+        "capacity_profile": "business-premium",
+        "relative_capacity": 5.0,
+        "capacity_source": "openai-help-center",
+        "capacity_verified_at": "2026-09-03T00:00:00Z"
+      },
+      "seat2": {
+        "label": "Standard",
+        "lifecycle": "active",
+        "home": null,
+        "capacity_profile": "business-standard",
+        "relative_capacity": 1.0,
+        "capacity_source": "openai-help-center",
+        "capacity_verified_at": "2026-09-03T00:00:00Z"
+      }
+    },
+    "primary": "seat1",
+    "deputy": "seat2",
+    "reserves_pct": {"seat1": 20, "seat2": 10},
+    "reserve_release_hours": 36,
+    "probe_stale_seconds": 21600,
+    "watch_probe_seconds": 300,
+    "telemetry_scan_seconds": 5,
+    "account_probe_timeout_seconds": 30,
+    "cap_cooldown_seconds": 18000,
+    "small_task_min_headroom_pct": 5,
+    "big_task_min_headroom_pct": 10,
+    "task_min_headroom_pct_by_seat": {},
+    "task_min_headroom_pct_by_capacity_multiplier": {
+      "1": {"small": 5, "big": 10},
+      "5": {"small": 10, "big": 20}
+    }
+  },
+  "control": {
+    "_comment": "Headroom floors below which an identity/provider stops accepting work.",
+    "auto_min_usable_pct": 30,
+    "manual_min_usable_pct": 10
+  },
+  "execution": {
+    "_comment": "Effort defaults reach both provider CLIs. Ultra is clamped to max unless the Codex account and setting support it.",
+    "worker_access": "restricted",
+    "delegation_policy": "auto",
+    "inline_max_minutes": 5,
+    "head_permissions": "full-access",
+    "parallel_min_minutes": 8,
+    "learning_min_samples": 8,
+    "head_worker_fallback": true,
+    "capacity": {
+      "fallback_burn_pct": {"small": 5, "big": 20},
+      "margin_pct": 5,
+      "margin_taper_max_hours": 36,
+      "margin_taper_window_fraction": 0.2,
+      "degraded_grace_seconds": 86400,
+      "degraded_extra_margin_pct": 10
+    },
+    "default_size_by_kind": {
+      "implementation": "big", "ui_ux": "big", "planning": "big", "audit": "big",
+      "security": "big", "mechanical": "small", "review": "small",
+      "debug": "small", "test": "small", "docs": "small", "research": "small",
+      "deep_research": "big"
+    },
+    "capability_tier_by_kind": {
+      "implementation": "complex", "ui_ux": "frontier", "planning": "frontier", "audit": "frontier",
+      "security": "frontier", "mechanical": "routine", "review": "complex",
+      "debug": "complex", "test": "routine", "docs": "routine", "research": "complex",
+      "deep_research": "frontier"
+    },
+    "effort_by_kind": {
+      "mechanical": "low", "docs": "low", "test": "medium", "debug": "high",
+      "implementation": "high", "ui_ux": "high", "review": "medium", "audit": "high",
+      "security": "max", "planning": "high", "research": "medium", "deep_research": "high"
+    },
+    "prefer_provider_by_kind": {
+      "implementation": "codex", "ui_ux": "codex", "mechanical": "codex", "debug": "codex",
+      "test": "codex", "docs": "codex", "review": "claude", "audit": "claude",
+      "security": "claude", "planning": "claude", "research": "claude",
+      "deep_research": "claude"
+    }
+  },
+  "review": {"mode": "off", "strategy": "single"},
+  "ui": {"theme": "system", "density": "comfortable", "accent": "teal"},
+  "providers": {
+    "local": {
+      "mode": "off",
+      "command": "qwen",
+      "max_turns": 100,
+      "repair_budget": 2
+    },
+    "claude": {
+      "_comment": "Changing provider mode requires a trusted interactive terminal and current-request attestation.",
+      "mode": "off",
+      "command": "claude",
+      "eligible_kinds": [
+        "implementation", "ui_ux", "mechanical", "review", "audit", "debug",
+        "security", "test", "docs", "planning", "research", "deep_research"
+      ],
+      "cooldown_seconds": 18000,
+      "model": null,
+      "model_roles": {
+        "frontier": "claude-fable-5-1", "complex": "claude-opus-5-5", "routine": "claude-sonnet-5"
+      },
+      "frontier_kinds": ["security", "audit", "ui_ux", "planning", "deep_research"],
+      "expires_at": null,
+      "usage_stale_seconds": 21600,
+      "active_usage_refresh": true,
+      "small_canary_max_minutes": 5,
+      "small_task_min_headroom_pct": 10,
+      "big_task_min_headroom_pct": 15
+    },
+    "codex": {
+      "_comment": "Set supports_ultra only after enrollment; otherwise workers safely clamp ultra to max.",
+      "supports_ultra": false,
+      "model_roles": {
+        "routine": "gpt-5.6-terra", "complex": "gpt-6-sol", "frontier": "gpt-6-astra"
+      },
+      "model_by_kind": {
+        "mechanical": "gpt-5.6-luna", "docs": "gpt-5.6-terra",
+        "test": "gpt-5.6-terra", "ui_ux": "gpt-6-astra"
+      }
+    }
+  },
+  "power": {"caffeinate": true, "require_ac": true},
+  "local_hosts": {},
+  "local_seats": {},
+  "projects": {
+    "_comment": "Register projects with codex-seat projects add/rename instead of editing live JSON.",
+    "your-project": {"path": "/Users/you/Development/your-project"}
+  }
+}

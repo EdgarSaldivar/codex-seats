@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Development demo</title>
+<style>
+  body { margin: 0; background: #eef2f7; color: #172338; font: 18px system-ui; }
+  main { width: 820px; margin: 60px auto; padding: 40px; background: white; border-radius: 20px; }
+  h1 { font-size: 40px; }
+  p { line-height: 1.5; }
+  button { padding: 14px 24px; background: #245adc; color: white; border: 0; border-radius: 8px; font: inherit; cursor: pointer; }
+</style>
+<main>
+  <h1>Development demo</h1>
+  <p>This small page checks the complete edit, render, interact and verify loop.</p>
+  <p id="count" aria-live="polite">Tap count: 0</p>
+  <button type="button">Add one</button>
+</main>
+<script>
+  let count = 0;
+  document.querySelector('button').addEventListener('click', () => {
+    document.querySelector('#count').textContent = `Tap count: ${++count}`;
+  });
+</script>
+</html>

@@ -1,0 +1,24 @@
+{
+  "schema": 6,
+  "seats": {
+    "seat1": {
+      "status": "ok",
+      "pct_left": 64,
+      "last_probe_limits": {
+        "weekly": {"pct": 64, "window_minutes": 10080}
+      }
+    }
+  },
+  "jobs": [
+    {
+      "id": "sanitized-historical-job",
+      "provider": "codex",
+      "seat": "seat1",
+      "status": "completed"
+    }
+  ],
+  "capacity_learning": {
+    "codex|weekly|gpt-test|small|default": {"samples": [4.0]}
+  },
+  "providers": {"claude": {"status": "off"}}
+}
