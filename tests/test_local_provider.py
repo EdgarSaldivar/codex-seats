@@ -593,15 +593,9 @@ def test_timeout_cancel_and_output_bound_are_post_start_unsafe(
     noisy = _fake_qwen(tmp_path, "x" * 200)
     noisy_settings = _settings(str(noisy))
     monkeypatch.undo()
-    monkeypatch.setattr(
-        provider_local.local_seats,
-        "probe_host",
-        lambda *args, **kwargs: _ready(noisy_settings),
-    )
     monkeypatch.setattr(provider_local, "MAX_QWEN_OUTPUT_BYTES", 100)
-    (tmp_path / "bound-control").mkdir(mode=0o700)
-    oversized = provider_local.run_local(
-        tmp_path / "bound-control", noisy_settings, _request(repository)
+    oversized = _run_ready(
+        monkeypatch, tmp_path / "bound-control", noisy_settings, _request(repository)
     )
     assert oversized.status == "failed" and oversized.fallback_safe is False
     assert "output limit" in oversized.message
