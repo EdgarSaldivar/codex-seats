@@ -26,7 +26,7 @@ def payload(count=1, credit="credit-a", email="one@example.test"):
 
 
 def setup(tmp_path, monkeypatch):
-    settings = registry_settings(["seat1"], deputy=None)
+    settings = registry_settings(["seat1"])
     write_settings(tmp_path, settings)
     home = runtime_seat_home(tmp_path, "seat1", settings)
     home.mkdir()

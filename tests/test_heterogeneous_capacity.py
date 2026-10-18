@@ -47,7 +47,6 @@ def _settings() -> dict:
         "seat2": _entry("business-standard", 1.0),
     }
     settings["pool"]["primary"] = "seat1"
-    settings["pool"]["deputy"] = "seat2"
     return settings
 
 

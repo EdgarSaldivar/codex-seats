@@ -798,7 +798,6 @@ def _registry_snapshot(text: str) -> dict[str, Any]:
     pool = document["pool"]
     return {
         "primary": pool.get("primary"),
-        "deputy": pool.get("deputy"),
         "seats": pool.get("seats", {}),
         "reserves_pct": pool.get("reserves_pct", {}),
         "small_task_min_headroom_pct": pool.get("small_task_min_headroom_pct"),
@@ -944,11 +943,39 @@ def _render_seat(record: Mapping[str, Any]) -> str:
     )
 
 
+def _agent_payload(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Add the agent envelope's ``ok``/``error`` beside the existing keys.
+
+    ``seats --json`` shapes predate the envelope and are read at top level, so
+    they are not moved under ``data``; ``schema`` was already 1.
+    """
+    payload = dict(report)
+    if payload.get("blockers"):
+        payload["ok"] = False
+        payload["error"] = {"code": "blocked", "message": "; ".join(payload["blockers"])}
+    elif payload.get("ok") is False and "error" not in payload:
+        errors = [item for item in payload.get("issues", []) if item["severity"] == "error"]
+        payload["error"] = {
+            "code": "doctor-errors",
+            "message": f"{len(errors)} error issue(s); see issues",
+        }
+    payload.setdefault("ok", True)
+    return payload
+
+
 def _print_report(report: Mapping[str, Any], *, as_json: bool) -> None:
     if as_json:
-        print(_json_dump(report))
+        print(_json_dump(_agent_payload(report)))
         return
     command = report["command"]
+    if command in {"pause", "resume", "refresh"}:
+        print(report["summary"])
+        for warning in report.get("warnings", []):
+            print(f"WARNING: {warning}")
+        if report.get("next_step"):
+            print(f"NEXT: {report['next_step']}")
+        print(report["notice"])
+        return
     if command == "list":
         summary = report["pool_summary"]
         lifecycle = summary["lifecycle"]
@@ -1039,13 +1066,20 @@ def _print_report(report: Mapping[str, Any], *, as_json: bool) -> None:
 
 
 def _mutation_guard() -> None:
+    """Refuse managed workers; heads, controllers and plain shells may manage seats."""
     context = current_controller()
-    if context.managed_worker:
+    if context.managed_worker or os.environ.get("CLAUDE_LEAD_WORKER") == "1":
         raise SeatsCLIError("managed workers cannot mutate the seat registry or run seat login")
+
+
+def _human_only_guard() -> None:
+    """Retire/remove/login stay with a human outside controller/head contexts."""
+    _mutation_guard()
+    context = current_controller()
     declared_head = os.environ.get("CODEX_SEATS_HEAD", "").lower()
     if context.is_controller or declared_head in {"codex", "claude"}:
         raise SeatsCLIError(
-            "controller/head contexts cannot mutate the seat registry or run seat login"
+            "controller/head contexts cannot retire or remove seats or run seat login"
         )
 
 
@@ -1117,7 +1151,6 @@ def _blocked_plan_report(
     pool = settings["pool"]
     registry = {
         "primary": pool.get("primary"),
-        "deputy": pool.get("deputy"),
         "seats": pool.get("seats", {}),
     }
     return {
@@ -1232,14 +1265,171 @@ def _run_login(root: Path, settings: Mapping[str, Any], selector: str) -> int:
     return 0
 
 
-def cmd_seats(args: argparse.Namespace, settings: dict[str, Any], root: Path) -> int:
+def _lifecycle(document: str, seat_id: str) -> str | None:
+    entry = json.loads(document).get("pool", {}).get("seats", {}).get(seat_id)
+    return entry.get("lifecycle") if isinstance(entry, Mapping) else None
+
+
+def _light_report(command: str, seat_id: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "schema": OUTPUT_SCHEMA,
+        "command": command,
+        "seat_id": seat_id,
+        **fields,
+        "notice": LOCAL_ONLY_NOTICE,
+    }
+
+
+def _pause(root: Path, settings: dict[str, Any], selector: str, *, dry_run: bool) -> dict[str, Any]:
+    """Deactivate an idle seat, or drain a busy one, through the seat manager."""
+    from .seat_manager import SeatManager
+
+    manager = SeatManager(root, settings)
     try:
+        plan = manager.preview_pause(selector)
+        before = _lifecycle(plan.preview.before, plan.seat_id)
+        after = _lifecycle(plan.preview.after, plan.seat_id)
+        changed = plan.preview.changed
+        if not dry_run:
+            outcome = manager.commit_pause(plan)
+            after = _lifecycle(outcome.result.after, plan.seat_id)
+            changed = outcome.result.changed
+    finally:
+        manager.close()
+    draining = after == "draining"
+    return _light_report(
+        "pause",
+        plan.seat_id,
+        planned=dry_run,
+        changed=changed,
+        mode=plan.mode,
+        busy=plan.busy,
+        lifecycle={"before": before, "after": after},
+        warnings=list(plan.preview.warnings),
+        next_step=(
+            f"rerun `codex-seat seats pause {plan.seat_id}` once its job finishes "
+            "to deactivate it"
+            if draining
+            else None
+        ),
+        summary=(
+            f"{'PLAN' if dry_run else 'APPLIED'} pause {plan.seat_id}: "
+            f"{before} -> {after}{' (busy: draining)' if plan.busy else ''}"
+        ),
+    )
+
+
+def _resume(
+    root: Path,
+    settings: dict[str, Any],
+    selector: str,
+    *,
+    dry_run: bool,
+    as_primary: bool,
+) -> dict[str, Any]:
+    """Reactivate after the same login-status and fresh-probe checks as the manager."""
+    import threading
+
+    from .seat_manager import SeatManager
+
+    manager = SeatManager(root, settings)
+    try:
+        preview = manager.preview_reactivate(selector, as_primary=as_primary)
+        before = _lifecycle(preview.before, preview.seat_id)
+        after = _lifecycle(preview.after, preview.seat_id)
+        changed = preview.changed
+        checks = "deferred" if dry_run else "not-needed"
+        if not dry_run and preview.changed:
+            result = manager.run_activation_checks(preview, threading.Event())
+            if not result.passed:
+                raise SeatsCLIError(f"resume refused: {result.detail}")
+            committed = manager.commit_activation(preview, result)
+            after = _lifecycle(committed.after, preview.seat_id)
+            changed = committed.changed
+            checks = "passed"
+    finally:
+        manager.close()
+    return _light_report(
+        "resume",
+        preview.seat_id,
+        planned=dry_run,
+        changed=changed,
+        lifecycle={"before": before, "after": after},
+        provider_checks=checks,
+        warnings=list(preview.warnings),
+        next_step=None,
+        summary=(
+            f"{'PLAN' if dry_run else 'APPLIED'} resume {preview.seat_id}: "
+            f"{before} -> {after}"
+            + (" (login status and a fresh usage probe run on apply)" if dry_run else "")
+        ),
+    )
+
+
+def _refresh(
+    root: Path, settings: dict[str, Any], selector: str | None, *, refresh_all: bool
+) -> dict[str, Any]:
+    """Run the dashboard refresher's own refresh path once, synchronously."""
+    from .watch import WatchRefresher
+
+    interval = float(settings.get("pool", {}).get("watch_probe_seconds", 300))
+    refresher = WatchRefresher(root, settings, interval, periodic=False)
+    try:
+        if refresh_all:
+            target = "all"
+            refresher.run_attempt()
+            snapshot = refresher.snapshot()
+            result = snapshot.last_result
+            status = (
+                "ok" if snapshot.last_succeeded
+                else "contended" if snapshot.last_succeeded is None
+                else "failed"
+            )
+        else:
+            target = _stable_selector(str(selector), settings)
+            status = refresher.run_selected_attempt(target)
+            result = refresher.selected_snapshot().last_result
+    finally:
+        refresher.stop(timeout=10.0)
+    return _light_report(
+        "refresh",
+        target,
+        status=status,
+        result=result,
+        warnings=[],
+        next_step=(
+            "another refresh holds the shared lock; retry shortly"
+            if status == "contended"
+            else None
+        ),
+        summary=f"REFRESH {target}: {status}" + (f" ({result})" if result else ""),
+    )
+
+
+_SELECTOR_ACTIONS = frozenset(_MUTATIONS - {"add"}) | {
+    "show", "login", "pause", "resume", "refresh",
+}
+
+
+def cmd_seats(args: argparse.Namespace, settings: dict[str, Any], root: Path) -> int:
+    from .seat_manager import ManagerError
+
+    try:
+        conflict = getattr(args, "seat_alias_error", None)
+        if conflict:
+            raise SeatsCLIError(conflict)
         _require_schema3(settings, root)
         action = args.seats_action
         if action == "list":
             report = seats_list_report(root, settings, include_all=args.all)
             _print_report(report, as_json=args.json)
             return 0
+        source = args.plan_args if action == "plan" else args
+        selector = getattr(source, "selector", None)
+        if source.seats_action in _SELECTOR_ACTIONS and selector is None and not (
+            source.seats_action == "refresh" and getattr(source, "all", False)
+        ):
+            raise SeatsCLIError(f"seats {source.seats_action} needs SEAT (positional or --seat)")
         if action == "show":
             report = seats_show_report(root, settings, args.selector)
             _print_report(report, as_json=args.json)
@@ -1253,11 +1443,40 @@ def cmd_seats(args: argparse.Namespace, settings: dict[str, Any], root: Path) ->
             )
             _print_report(report, as_json=args.json)
             return 0 if report["ok"] else 1
+        if action in {"pause", "resume", "refresh"}:
+            if action == "refresh" and args.all and selector is not None:
+                raise SeatsCLIError("seats refresh takes SEAT or --all, not both")
+            dry_run = bool(getattr(args, "dry_run", False))
+            if not dry_run:
+                _mutation_guard()
+            if action == "pause":
+                report = _pause(root, settings, str(selector), dry_run=dry_run)
+            elif action == "resume":
+                report = _resume(
+                    root, settings, str(selector), dry_run=dry_run,
+                    as_primary=bool(args.as_primary),
+                )
+            else:
+                report = _refresh(root, settings, selector, refresh_all=bool(args.all))
+                if report["status"] != "ok":
+                    payload = {
+                        **report,
+                        "ok": False,
+                        "error": {
+                            "code": f"refresh-{report['status']}",
+                            "message": str(report["result"] or report["status"]),
+                        },
+                    }
+                    if args.json:
+                        print(_json_dump(payload))
+                    else:
+                        _print_report(report, as_json=False)
+                    return 1
+            _print_report(report, as_json=args.json)
+            return 0
 
         planned = action == "plan" or bool(getattr(args, "dry_run", False))
-        source = args.plan_args if action == "plan" else args
         mutation = source.seats_action
-        selector = getattr(source, "selector", None)
         options = _core_options(source)
         if planned:
             try:
@@ -1278,6 +1497,7 @@ def cmd_seats(args: argparse.Namespace, settings: dict[str, Any], root: Path) ->
 
         _mutation_guard()
         if mutation in {"retire", "remove", "login"}:
+            _human_only_guard()
             _trusted_terminal(source, mutation)
         if mutation == "login":
             return _run_login(root, settings, str(selector))
@@ -1291,12 +1511,14 @@ def cmd_seats(args: argparse.Namespace, settings: dict[str, Any], root: Path) ->
             as_json=args.json,
         )
         return 0
-    except (SeatsCLIError, SeatAdminError, SeatRegistryError, OSError, ValueError) as exc:
+    except (
+        SeatsCLIError, SeatAdminError, SeatRegistryError, ManagerError, OSError, ValueError
+    ) as exc:
         payload = {
             "schema": OUTPUT_SCHEMA,
             "command": "seats",
             "ok": False,
-            "error": str(exc),
+            "error": {"code": "refused", "message": str(exc)},
             "notice": LOCAL_ONLY_NOTICE,
         }
         if getattr(args, "json", False):
@@ -1320,6 +1542,18 @@ def _add_common_mutation_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_selector(parser: argparse.ArgumentParser, *, help_text: str | None = None) -> None:
+    """Positional SEAT plus the ``--seat SEAT`` alias used across the CLI."""
+    parser.add_argument("selector", nargs="?", metavar="SEAT", help=help_text)
+    parser.add_argument(
+        "--seat",
+        dest="seat_option",
+        metavar="SEAT",
+        default=argparse.SUPPRESS,
+        help="same as the positional SEAT (seatN or numeric shorthand)",
+    )
+
+
 def _register_mutation(
     sub: argparse._SubParsersAction[argparse.ArgumentParser], name: str
 ) -> argparse.ArgumentParser:
@@ -1336,7 +1570,7 @@ def _register_mutation(
         parser.add_argument("--home")
         parser.add_argument("--profile")
     else:
-        parser.add_argument("selector")
+        _add_selector(parser)
     if name == "set":
         parser.add_argument("--label")
         parser.add_argument("--home")
@@ -1347,7 +1581,8 @@ def _register_mutation(
         parser.add_argument("--small-task-min-headroom-pct", type=float)
         parser.add_argument("--big-task-min-headroom-pct", type=float)
     elif name == "set-role":
-        parser.add_argument("role", choices=("primary", "deputy", "worker"))
+        # Validated by seat_admin so a legacy "deputy" gets a clear message.
+        parser.add_argument("role", metavar="{primary,worker}")
     elif name == "activate":
         parser.add_argument("--as-primary", action="store_true")
     elif name == "drain":
@@ -1380,18 +1615,41 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     list_parser.add_argument("--json", action="store_true")
 
     show = seats_sub.add_parser("show", help="show one local identity")
-    show.add_argument("selector")
+    _add_selector(show)
     show.add_argument("--json", action="store_true")
 
     doctor = seats_sub.add_parser(
         "doctor", help="diagnose registry, capacity, homes, and owner follow-ups"
     )
-    doctor.add_argument("selector", nargs="?")
+    _add_selector(doctor)
     doctor.add_argument("--all", action="store_true")
     doctor.add_argument("--json", action="store_true")
 
     for name in sorted(_MUTATIONS | {"login"}):
         _register_mutation(seats_sub, name)
+
+    pause = seats_sub.add_parser(
+        "pause",
+        help="stop routing to a seat: deactivate it when idle, drain it when busy",
+    )
+    _add_selector(pause)
+    resume = seats_sub.add_parser(
+        "resume",
+        help="reactivate a paused seat after login-status and fresh usage checks",
+    )
+    _add_selector(resume)
+    resume.add_argument("--as-primary", action="store_true")
+    for parser in (pause, resume):
+        _add_common_mutation_flags(parser)
+    refresh = seats_sub.add_parser(
+        "refresh",
+        help="read fresh provider usage for one seat, or the whole pool with --all",
+    )
+    _add_selector(refresh)
+    refresh.add_argument(
+        "--all", action="store_true", help="all active/draining Codex seats and Claude"
+    )
+    refresh.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
 
     plan = seats_sub.add_parser("plan", help="render an exact mutation without writing")
     plan.add_argument("--json", action="store_true")
@@ -1406,10 +1664,17 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
 
 
 def normalize_plan_args(args: argparse.Namespace) -> None:
-    if (
-        getattr(args, "handler", None) != "seats"
-        or getattr(args, "seats_action", None) != "plan"
-    ):
+    if getattr(args, "handler", None) != "seats":
+        return
+    alias = getattr(args, "seat_option", None)
+    if alias is not None:
+        positional = getattr(args, "selector", None)
+        if positional is not None and positional != alias:
+            args.seat_alias_error = (
+                f"SEAT {positional!r} and --seat {alias!r} disagree; pass one"
+            )
+        args.selector = alias
+    if getattr(args, "seats_action", None) != "plan":
         return
     nested = argparse.Namespace(**vars(args))
     nested.seats_action = args.plan_action

@@ -11,13 +11,12 @@ from .capacity import seat_capacity_report
 from .display import (
     _claude_remaining,
     _control_claim,
-    _countdown,
     _reset_windows,
     _rotation_warning,
     _view_seat_ids,
-    _window_label,
     role_badges,
 )
+from .tui_style import ago, day, human, stamp, until, window_label
 from . import dispatch_client
 from .dispatch_protocol import DispatchError, count_ready_frames
 from .state import (
@@ -74,11 +73,6 @@ def _next_active_reset(limits: Any, *, current: float) -> float | None:
     resets = [reset for _name, reset in _reset_windows(limits) if reset > current]
     return min(resets) if resets else None
 
-def _absolute_local(timestamp: float) -> str:
-    value = datetime.fromtimestamp(timestamp).astimezone()
-    return f"{value:%a %b} {value.day} {value:%H:%M %Z}"
-
-
 def _last_reset_observation(cycles: dict[str, Any], name: str) -> str:
     cycle = cycles.get(name)
     if not isinstance(cycle, dict):
@@ -89,7 +83,7 @@ def _last_reset_observation(cycles: dict[str, Any], name: str) -> str:
         return "none observed since tracking began"
     cause = cycle.get("last_reset_cause")
     suffix = f"; {cause}" if cause else ""
-    return f"{_absolute_local(timestamp)}{suffix}"
+    return f"{stamp(timestamp)}{suffix}"
 
 
 def resets_report(root: Path, settings: dict[str, Any]) -> str:
@@ -118,21 +112,26 @@ def resets_report(root: Path, settings: dict[str, Any]) -> str:
     for seat_id in _view_seat_ids(settings):
         seat = snapshot["seats"][seat_id]
         entry = settings["pool"]["seats"][seat_id]
-        lines.append(f"  {badges[seat_id]} {seat_id} [{entry['lifecycle']}]")
+        lines.append(
+            f"  {badges[seat_id]} {seat_id} [{human('lifecycle', entry['lifecycle']).lower()}]"
+        )
         from .account import banked_reset_report
         bank = banked_reset_report(seat, settings, root=root, seat_id=seat_id)
         count = bank['available_count'] if bank['status'] == 'fresh' else 'unknown'
-        lines.append(f"    banked resets: {count} ({bank['status']}; observed {bank['observed_at'] or 'never'})")
+        lines.append(
+            f"    banked resets: {count} ({human('bank_status', bank['status']).lower()}; "
+            f"observed {ago(bank['observed_at'])})"
+        )
         for credit in bank['credits']:
             granted = credit.get('granted_at')
             expires = credit.get('expires_at')
             lines.append(f"      {credit.get('title') or credit.get('reset_type') or 'credit'}: "
-                         f"{credit.get('status') or 'unknown'}, granted {_absolute_local(granted) if granted else 'unknown'}, "
-                         f"expires {_absolute_local(expires) if expires else ('none' if credit.get('expiry_status') == 'none' else 'unknown')}")
+                         f"{credit.get('status') or 'unknown'}, granted {day(granted) if granted else 'unknown'}, "
+                         f"expires {day(expires) if expires else ('none' if credit.get('expiry_status') == 'none' else 'unknown')}")
         report = operator["seat_capacity"][seat_id]
         declared = entry.get("relative_capacity")
         lines.append(
-            f"    {entry['label']} · {entry['capacity_profile']} · "
+            f"    {entry['label']} · {human('capacity_profile', entry['capacity_profile'])} · "
             f"declared {'unverified' if declared is None else f'{float(declared):g}x'} / "
             f"effective {report['effective_relative_multiplier']:g}x · "
             f"{entry['capacity_source']} · verified {entry['capacity_verified_at'] or 'never'}"
@@ -149,9 +148,10 @@ def resets_report(root: Path, settings: dict[str, Any]) -> str:
                 raw = seat.get("last_probe_limits", {}).get(name, {})
                 pct = raw.get("pct") if isinstance(raw, dict) else None
                 left = "?" if not isinstance(pct, (int, float)) else f"{float(pct):g}% left"
+                minutes = raw.get("window_minutes") if isinstance(raw, dict) else None
                 lines.append(
-                    f"    {_window_label(name):7} {left:10} → {_absolute_local(reset_at)} "
-                    f"(in {_countdown(reset_at, compact=False)})"
+                    f"    {window_label(name, minutes):7} {left:10} → {stamp(reset_at)} "
+                    f"({until(reset_at)})"
                 )
                 if isinstance(pct, (int, float)):
                     report_window = next(
@@ -161,7 +161,8 @@ def resets_report(root: Path, settings: dict[str, Any]) -> str:
                                 "capacity_windows"
                             ]
                             if window["name"] == name
-                            or _window_label(window["name"]) == _window_label(name)
+                            or window_label(window["name"], short=True)
+                            == window_label(name, minutes, short=True)
                         ),
                         None,
                     )
@@ -177,7 +178,9 @@ def resets_report(root: Path, settings: dict[str, Any]) -> str:
                 )
 
     limits = claude_limits
-    lines.append(f"Claude windows (mode={mode}{'; ' + reason if reason else ''}):")
+    lines.append(
+        f"Claude windows (mode {human('claude_mode', mode)}{'; ' + reason if reason else ''}):"
+    )
     if not limits:
         lines.append("  unknown; run a useful interactive Claude turn to refresh its status-line data")
     else:
@@ -186,8 +189,7 @@ def resets_report(root: Path, settings: dict[str, Any]) -> str:
             remaining = raw.get("remaining_percentage") if isinstance(raw, dict) else None
             left = "?" if not isinstance(remaining, (int, float)) else f"{float(remaining):g}% left"
             lines.append(
-                f"  {_window_label(name):7} {left:10} → {_absolute_local(reset_at)} "
-                f"(in {_countdown(reset_at, compact=False)})"
+                f"  {window_label(name):7} {left:10} → {stamp(reset_at)} ({until(reset_at)})"
             )
             lines.append(
                 f"    last observed reset: "

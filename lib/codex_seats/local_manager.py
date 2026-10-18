@@ -5,8 +5,8 @@ error types and contract. It never writes settings JSON directly: every write
 flows through :func:`local_cli.mutate` using the distinct internal
 ``MANAGER_AUTHORITY`` path, which re-reads and digest-pins the settings inside
 the settings lock and is accepted only when
-:func:`seat_manager.ensure_management_eligible` passes (a real stdin/stdout TTY
-outside controller/head and managed-worker contexts, PTY or not) and the
+:func:`seat_manager.ensure_not_managed_worker` passes (any context except a
+managed worker; the interactive manager itself is gated by a real TTY) and the
 caller passes the explicit current-request confirmation marker. The existing
 CLI guards are untouched: this layer is not reachable from ``codex-seat local``.
 
@@ -58,7 +58,7 @@ from .seat_manager import (
     StalePreviewError,
     _freeze,
     _thaw,
-    ensure_management_eligible,
+    ensure_not_managed_worker,
 )
 
 LOCAL_ACTIONS = frozenset(local_cli.STRUCTURED_ACTIONS)
@@ -328,8 +328,7 @@ class LocalSeatManager:
     def commit(self, preview: LocalActionPreview, *, from_current_user_request: bool) -> LocalMutationResult:
         """Apply a previewed local write with the explicit confirmation marker.
 
-        Refused after close, for controller/head and managed-worker contexts
-        (even on a PTY), without a real TTY, and without
+        Refused after close, for managed workers, and without
         ``from_current_user_request=True`` from the UI confirmation. The write
         is pinned to ``preview.expected_digest``; any settings change since the
         preview raises :class:`StalePreviewError` with nothing written.
@@ -399,9 +398,9 @@ class LocalSeatManager:
 
     @staticmethod
     def _authorize(action: str) -> None:
-        """Distinct manager authority: real human TTY outside excluded contexts."""
+        """Distinct manager authority: anything but a managed worker."""
         try:
-            ensure_management_eligible()
+            ensure_not_managed_worker()
         except ManagerEligibilityError as exc:
             raise ManagerEligibilityError(f"{action} refused: {exc}") from exc
 

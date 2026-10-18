@@ -31,6 +31,3 @@ package-dir = { codex_seats = "lib/codex_seats" }
 # workers.py deliberately re-exports imported names and has a late import that
 # breaks an import cycle. Autofixing either rule would break that facade.
 "lib/codex_seats/workers.py" = ["F401", "E402"]
-
-[tool.setuptools.package-data]
-codex_seats = ["ui/*.html", "ui/*.css", "ui/*.js"]

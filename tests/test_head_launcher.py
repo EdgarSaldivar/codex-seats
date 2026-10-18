@@ -117,7 +117,7 @@ def test_full_access_head_does_not_require_head_profile(tmp_path):
 
 
 def test_explicit_seat_launches_without_a_configured_primary(tmp_path, monkeypatch):
-    settings = registry_settings(["seat3"], primary=None, deputy=None)
+    settings = registry_settings(["seat3"], primary=None)
     events = []
     monkeypatch.setattr(hl.workers, "resolve_executable", lambda *_args: "/bin/codex")
     monkeypatch.setattr(hl, "launch", lambda argv, env: events.append((argv, env)))

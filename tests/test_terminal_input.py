@@ -2,7 +2,14 @@
 import io
 import os
 
-from codex_seats.terminal import TerminalSession, display_width, paint_frame, wrap_lines
+from codex_seats.terminal import (
+    KEY_BACKTAB,
+    TerminalSession,
+    decode_key,
+    display_width,
+    paint_frame,
+    wrap_lines,
+)
 
 
 def test_frame_paints_full_width_rows_without_erasing_last_cell_or_scrolling():
@@ -49,3 +56,20 @@ def test_wide_preview_wrapping_preserves_every_character():
     pieces = wrap_lines([text], 8)
     assert ''.join(pieces) == text
     assert all(display_width(piece) <= 8 for piece in pieces)
+
+
+def test_shift_tab_decodes_as_backtab_alone_and_inside_a_burst():
+    assert KEY_BACKTAB == '\x1b[Z'
+    assert decode_key(b'\x1b[Z') == KEY_BACKTAB
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, 'rb', buffering=0) as source:
+            terminal = TerminalSession(source, io.StringIO())
+            os.write(write_fd, b'\x1b[Z\t\x1b[')
+            assert terminal.read_key(0.1) == KEY_BACKTAB
+            assert terminal.read_key(0.1) == '\t'
+            assert terminal.read_key(0.1) is None  # fragment waits for its final byte
+            os.write(write_fd, b'Z')
+            assert terminal.read_key(0.1) == KEY_BACKTAB
+    finally:
+        os.close(write_fd)

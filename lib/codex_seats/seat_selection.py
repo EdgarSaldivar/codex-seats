@@ -89,9 +89,13 @@ def pick_seat(
         bonus = min(20.0, usable * 0.25) * urgency
         return usable + bonus
 
+    # The primary is the interactive/head identity: spend every fitting worker
+    # first and fall back to the primary only when no worker fits.
+    primary = settings.get("pool", {}).get("primary")
     return min(
         candidates,
         key=lambda seat_id: (
+            seat_id == primary,
             capacity_class(seat_id),
             -drain_score(seat_id),
             int(seats[seat_id].get("spent_since_probe", 0)),

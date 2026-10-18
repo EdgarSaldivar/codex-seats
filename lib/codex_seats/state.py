@@ -85,7 +85,6 @@ def default_settings() -> dict[str, Any]:
         "schema": SETTINGS_SCHEMA,
         "pool": {
             "primary": None,
-            "deputy": None,
             "seats": {},
             "reserves_pct": {},
             "reserve_release_hours": 36,
@@ -140,11 +139,6 @@ def default_settings() -> dict[str, Any]:
         "review": {
             "mode": POLICY_DEFAULTS["review.mode"],
             "strategy": POLICY_DEFAULTS["review.strategy"],
-        },
-        "ui": {
-            "theme": POLICY_DEFAULTS["ui.theme"],
-            "density": POLICY_DEFAULTS["ui.density"],
-            "accent": POLICY_DEFAULTS["ui.accent"],
         },
         "providers": {
             "local": {
@@ -273,6 +267,27 @@ def _without_comments(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+# Retired settings that older files may still carry, as dotted paths. They are
+# preserved verbatim, never read, and do not warn: ``ui`` held the removed
+# browser manager's appearance preferences; the two pool keys belonged to the
+# pre-schema-3 "primary waits for a non-primary" flag and an unused bank expiry.
+LEGACY_SETTINGS_KEYS = frozenset({
+    "ui",
+    "pool.primary_wait_for_eligible_nonprimary",
+    "pool.banked_reset_standard_expiry_days",
+})
+
+
+def _legacy_keys(section: str = "") -> set[str]:
+    """Legacy key names directly under ``section`` ("" is the top level)."""
+    prefix = f"{section}." if section else ""
+    return {
+        path[len(prefix):]
+        for path in LEGACY_SETTINGS_KEYS
+        if path.startswith(prefix) and "." not in path[len(prefix):]
+    }
+
+
 def _warn_unknown_keys(
     value: Any, allowed: set[str], path: str, warnings: list[str]
 ) -> None:
@@ -297,6 +312,12 @@ def _canonicalize_settings(raw: dict[str, Any]) -> tuple[dict[str, Any], list[st
             "templates/settings.example.json)"
         )
     canonical, warnings = _without_comments(raw), []
+    pool = canonical.get("pool")
+    if isinstance(pool, dict):
+        # The deputy role was removed: a legacy pool.deputy is ignored silently
+        # and, because it is gone from the canonical document, dropped on the
+        # next settings write.
+        pool.pop("deputy", None)
 
     providers = canonical.get("providers")
     claude = providers.get("claude") if isinstance(providers, dict) else None
@@ -330,11 +351,15 @@ def _canonicalize_settings(raw: dict[str, Any]) -> tuple[dict[str, Any], list[st
                 )
 
     defaults = default_settings()
-    _warn_unknown_keys(canonical, set(defaults), "", warnings)
+    _warn_unknown_keys(canonical, set(defaults) | _legacy_keys(), "", warnings)
     for section in ("pool", "control", "providers", "power"):
-        _warn_unknown_keys(canonical.get(section), set(defaults[section]), section, warnings)
+        _warn_unknown_keys(
+            canonical.get(section),
+            set(defaults[section]) | _legacy_keys(section),
+            section,
+            warnings,
+        )
     _warn_unknown_keys(canonical.get("review"), set(defaults["review"]), "review", warnings)
-    _warn_unknown_keys(canonical.get("ui"), set(defaults["ui"]), "ui", warnings)
     _warn_unknown_keys(
         canonical.get("execution"),
         set(defaults["execution"])

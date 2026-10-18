@@ -377,18 +377,15 @@ def active_seat_ids(settings: Mapping[str, Any]) -> list[str]:
 
 
 def derive_roles(settings: Mapping[str, Any]) -> dict[str, str]:
-    """Derive roles for active seats; inactive/draining/retired seats have no role."""
-    pool = settings.get("pool", {})
-    primary, deputy = pool.get("primary"), pool.get("deputy")
-    roles: dict[str, str] = {}
-    for seat_id in active_seat_ids(settings):
-        if seat_id == primary:
-            roles[seat_id] = "primary"
-        elif seat_id == deputy:
-            roles[seat_id] = "deputy"
-        else:
-            roles[seat_id] = "worker"
-    return roles
+    """Derive roles for active seats; inactive/draining/retired seats have no role.
+
+    Roles are only ``primary`` and ``worker``; routing spends the primary last.
+    """
+    primary = settings.get("pool", {}).get("primary")
+    return {
+        seat_id: "primary" if seat_id == primary else "worker"
+        for seat_id in active_seat_ids(settings)
+    }
 
 
 def resolve_readonly_selector(selector: str, settings: Mapping[str, Any]) -> str:
@@ -720,17 +717,12 @@ def validate_schema3(settings: Mapping[str, Any], pool_root: Path | None = None)
         _validate_entry(seat_id, entry)
 
     active = set(active_seat_ids(settings))
-    primary, deputy = pool.get("primary"), pool.get("deputy")
+    primary = pool.get("primary")
     if primary is None:
         if active:
             raise SeatRegistryError("pool.primary may be null only when there are no active seats")
     elif primary not in active:
         raise SeatRegistryError("pool.primary must name an active registered seat")
-    if deputy is not None:
-        if deputy not in active:
-            raise SeatRegistryError("pool.deputy must be null or name an active registered seat")
-        if deputy == primary:
-            raise SeatRegistryError("pool.deputy must be distinct from pool.primary")
 
     root = pool_root if pool_root is not None else Path("/__codex_seats_pool__")
     homes: dict[str, str] = {}

@@ -215,7 +215,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--implementer", choices=["codex", "claude"], default="codex")
     parser.add_argument("--strategy", choices=["single", "cross"])
     parser.add_argument("--review-model", help="Codex reviewer model override")
-    parser.add_argument("--codex-seat", type=_seat)
+    parser.add_argument("--codex-seat", "--seat", dest="codex_seat", type=_seat)
     parser.set_defaults(handler="review")
 
 

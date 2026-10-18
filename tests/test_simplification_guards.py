@@ -16,7 +16,7 @@ from codex_seats.seat_manager import ManagerEligibilityError
 from codex_seats.state import default_settings
 
 
-def test_policy_apply_requires_management_eligibility_and_preserves_bytes(tmp_path, monkeypatch):
+def test_policy_apply_refuses_managed_workers_and_preserves_bytes(tmp_path, monkeypatch):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps(default_settings(), indent=2) + "\n")
     before = path.read_bytes()
@@ -25,7 +25,7 @@ def test_policy_apply_requires_management_eligibility_and_preserves_bytes(tmp_pa
         config_command="policy", policy_action="set", policy_change=["review.mode", "blocking"],
         apply=True,
     )
-    with mock.patch("codex_seats.seat_manager.ensure_management_eligible", side_effect=ManagerEligibilityError("real human terminal required")) as eligible:
+    with mock.patch("codex_seats.seat_manager.ensure_not_managed_worker", side_effect=ManagerEligibilityError("managed workers cannot change seats or pool settings")) as eligible:
         assert cli.cmd_config(args, default_settings()) == 2
     eligible.assert_called_once_with()
     assert path.read_bytes() == before

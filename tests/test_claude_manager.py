@@ -269,10 +269,10 @@ def test_commit_requires_confirmation_eligibility_and_open_manager(
         manager.commit(preview, from_current_user_request=True)
     monkeypatch.delenv("CODEX_SEATS_MANAGED_WORKER")
 
-    monkeypatch.setenv("CODEX_SEATS_HEAD", "claude")
+    monkeypatch.setenv("CLAUDE_LEAD_WORKER", "1")
     with pytest.raises(ManagerEligibilityError):
         manager.commit(preview, from_current_user_request=True)
-    monkeypatch.delenv("CODEX_SEATS_HEAD")
+    monkeypatch.delenv("CLAUDE_LEAD_WORKER")
 
     manager.close()
     with pytest.raises(ManagerClosedError):

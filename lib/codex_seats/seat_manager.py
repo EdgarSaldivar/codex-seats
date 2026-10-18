@@ -23,12 +23,14 @@ Design contract
   status and fresh usage probe off the main loop with a cancel event, so the UI
   stays responsive; :meth:`commit_activation` applies the confirmed activation
   on the main loop with current runtime validation.
-* **Eligibility.** :func:`ensure_management_eligible` requires a real
-  stdin/stdout TTY and excludes controller/head and managed-worker contexts.
+* **Eligibility.** :func:`ensure_interactive_terminal` gates the interactive
+  manager (a real stdin/stdout TTY, not a managed worker). Mutations need only
+  :func:`ensure_not_managed_worker`, so heads and plain shells may manage too.
 
 Public API (for worker B)
 --------------------------
-* ``ensure_management_eligible(*, stdin, stdout, env)``
+* ``ensure_interactive_terminal(*, stdin, stdout, env)`` (alias
+  ``ensure_management_eligible``) / ``ensure_not_managed_worker(*, env)``
 * ``SeatManager(root, settings, *, refresher=None, clock=time.time)``
 * ``manager.list_report(include_all=True)`` / ``manager.detail_report(selector)``
 * ``manager.identity_report(selector)`` (manager-only cached provider identity)
@@ -221,18 +223,32 @@ class LoginPlan:
         return value
 
 
-def ensure_management_eligible(
+def ensure_not_managed_worker(*, env: Mapping[str, str] | None = None) -> None:
+    """Refuse pool and settings mutations from managed workers.
+
+    Heads, controllers and plain shells may do light management; only a managed
+    worker (``CODEX_SEATS_MANAGED_WORKER=1`` or ``CLAUDE_LEAD_WORKER=1``) is
+    refused, with or without a terminal.
+    """
+    source = os.environ if env is None else env
+    context = current_controller(source)
+    if context.managed_worker or source.get("CLAUDE_LEAD_WORKER") == "1":
+        raise ManagerEligibilityError(
+            "managed workers cannot change seats or pool settings"
+        )
+
+
+def ensure_interactive_terminal(
     *,
     stdin: Any | None = None,
     stdout: Any | None = None,
     env: Mapping[str, str] | None = None,
 ) -> None:
-    """Fail closed unless a real human terminal outside excluded contexts.
+    """Gate the interactive manager: a real stdin/stdout TTY, not a managed worker.
 
-    Requires an interactive stdin/stdout TTY and rejects controller/head and
-    managed-worker contexts. Normal captured (non-TTY) watch never calls this,
-    so its behavior is unchanged; an explicit management request in an excluded
-    context fails clearly here.
+    Normal captured (non-TTY) watch never calls this, so its behavior is
+    unchanged; an explicit ``dash --manage`` without a terminal fails clearly.
+    A human in a head pane with a real terminal may open the manager.
     """
     stream_in = sys.stdin if stdin is None else stdin
     stream_out = sys.stdout if stdout is None else stdout
@@ -245,17 +261,16 @@ def ensure_management_eligible(
         raise ManagerEligibilityError(
             "interactive seat management requires a real stdin/stdout terminal"
         )
-    source = os.environ if env is None else env
-    context = current_controller(source)
-    if context.managed_worker:
+    try:
+        ensure_not_managed_worker(env=env)
+    except ManagerEligibilityError as exc:
         raise ManagerEligibilityError(
             "managed workers cannot open interactive seat management"
-        )
-    declared_head = (source.get("CODEX_SEATS_HEAD") or "").lower()
-    if context.is_controller or declared_head in {"codex", "claude"}:
-        raise ManagerEligibilityError(
-            "controller/head contexts cannot open interactive seat management"
-        )
+        ) from exc
+
+
+# Former name of the interactive-manager gate, kept for existing importers.
+ensure_management_eligible = ensure_interactive_terminal
 
 
 class SeatManager:
@@ -326,7 +341,7 @@ class SeatManager:
     def commit_global_settings(self, preview: PolicyPreview) -> bool:
         with self._lock:
             self._ensure_open()
-            ensure_management_eligible()
+            ensure_not_managed_worker()
             try:
                 changed = apply_policy(self.root, preview)
             except (PolicyError, ValueError, OSError) as exc:
@@ -456,7 +471,7 @@ class SeatManager:
         from .seat_registry import resolve_home
 
         self._ensure_open()
-        self._mutation_guard(seats_cli)
+        self._mutation_guard(seats_cli, human_only=True)
         try:
             if seat_admin.settings_digest(self.root) != plan.expected_digest:
                 raise StalePreviewError(
@@ -488,8 +503,8 @@ class SeatManager:
     def commit(self, preview: ActionPreview) -> SeatMutationResult:
         """Apply a previewed action on the main loop with runtime validation.
 
-        The action is refused after close, guarded against controller/head and
-        managed-worker contexts, and pinned to ``preview.expected_digest`` so a
+        The action is refused after close and in managed-worker contexts
+        (retirement also in controller/head contexts), and pinned to ``preview.expected_digest`` so a
         settings change since the preview raises :class:`StalePreviewError`
         with nothing written.
         """
@@ -497,7 +512,7 @@ class SeatManager:
 
         with self._lock:
             self._ensure_open()
-            self._mutation_guard(seats_cli)
+            self._mutation_guard(seats_cli, human_only=preview.action == "retire")
             self._verify_current(preview)
             options = dict(preview.options)
             try:
@@ -883,9 +898,12 @@ class SeatManager:
                 "the seat manager has closed and cannot mutate settings"
             )
 
-    def _mutation_guard(self, seats_cli: Any) -> None:
+    def _mutation_guard(self, seats_cli: Any, *, human_only: bool = False) -> None:
         try:
-            seats_cli._mutation_guard()
+            if human_only:
+                seats_cli._human_only_guard()
+            else:
+                seats_cli._mutation_guard()
         except seats_cli.SeatsCLIError as exc:
             raise ManagerEligibilityError(str(exc)) from exc
 

@@ -45,7 +45,6 @@ def registry_settings(
     seats: int | list[str] = 5,
     *,
     primary: str | None = "seat1",
-    deputy: str | None = "seat2",
     primary_home: str | Path | None = None,
 ) -> dict[str, Any]:
     """Default settings plus active seats (``seat1..seatN`` for an int)."""
@@ -68,7 +67,6 @@ def registry_settings(
         for seat_id in seat_ids
     }
     pool["primary"] = primary if primary in pool["seats"] else None
-    pool["deputy"] = deputy if deputy in pool["seats"] else None
     return settings
 
 

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from codex_seats import dispatch_protocol as dp
-from codex_seats.display import DashboardViewState, dashboard, segment
+from codex_seats.display import DashboardViewState, dashboard, role_badges, segment
 from codex_seats.display_status import status_json
 from codex_seats.state import (
     Ledger,
@@ -98,16 +98,16 @@ class DisplayTests(unittest.TestCase):
             self.healthy_pool(root, settings, current)
             wide = dashboard(root, settings, [], color=False, width=160, at=current)
             compact = dashboard(root, settings, [], color=False, width=80, at=current)
-            self.assertIn("claude (Max 5x)", wide)
-            self.assertIn("claude (Max 5x)", compact)
+            self.assertIn("C claude Max 5x", wide)
+            self.assertIn("C claude Max 5x", compact)
             settings["providers"]["claude"]["subscription_tier"] = "Team Premium"
             self.assertIn(
-                "claude (Team Premium)",
+                "claude Team Premium",
                 dashboard(root, settings, [], color=False, width=120, at=current),
             )
             narrow = dashboard(root, settings, [], color=False, width=50, at=current)
-            self.assertIn("C Team Premium", narrow)
-            self.assertIn("60% remaining", narrow)
+            self.assertIn("C claude Team Premium", narrow)
+            self.assertIn("7d ███░░  60%", narrow)
 
     def test_codex_dashboard_uses_configured_plan_name_beside_label(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,19 +128,19 @@ class DisplayTests(unittest.TestCase):
             self.healthy_pool(root, settings, current)
             wide = dashboard(root, settings, [], color=False, width=160, at=current)
             compact = dashboard(root, settings, [], color=False, width=80, at=current)
-            self.assertIn("Primary (Premium 5x)", wide)
-            self.assertIn("Primary (Premium 5x)", compact)
+            self.assertIn("P Primary Premium 5x", wide)
+            self.assertIn("P Primary Premium", compact)
             self.assertNotIn("Primary@5x", wide)
 
             seat["capacity_profile"] = "business-standard"
             self.assertIn(
-                "Primary (Standard 1x)",
+                "Primary Standard 1x",
                 dashboard(root, settings, [], color=False, width=160, at=current),
             )
 
             seat["capacity_profile"] = "custom-profile"
             self.assertIn(
-                "Primary (profile: custom-profile)",
+                "Primary Custom profile",
                 dashboard(root, settings, [], color=False, width=160, at=current),
             )
 
@@ -245,9 +245,9 @@ class DisplayTests(unittest.TestCase):
             busy_line = next(
                 line for line in full_dashboard.splitlines() if "seat5" in line
             )
-            self.assertIn("S+B", busy_line)
+            self.assertIn("small+big", busy_line)
             self.assertIn("●", busy_line)
-            self.assertIn("C    claude", full_dashboard)
+            self.assertIn("C claude", full_dashboard)
             self.assertIn("50%", full_dashboard)
             self.assertIn("ONGOING WORK", full_dashboard)
             machine = json.loads(status_json(root, settings))
@@ -302,9 +302,9 @@ class DisplayTests(unittest.TestCase):
             after = filesystem_state()
 
             self.assertIn("seats", machine)
-            self.assertIn("SIGNAL TABLE", rendered)
+            self.assertIn("codex-seats", rendered)
             self.assertIn('"seats"', json_status.stdout)
-            self.assertIn("SIGNAL TABLE", normal_status.stdout)
+            self.assertIn("codex-seats", normal_status.stdout)
             self.assertEqual(before, after)
 
     def test_status_pending_counts_only_durable_ready_frames(self):
@@ -389,7 +389,7 @@ class DisplayTests(unittest.TestCase):
                 }
             rendered = dashboard(root, settings, [], color=False)
             self.assertIn("ONGOING WORK", rendered)
-            self.assertIn("map the migration · Running · seat3 · planning", rendered)
+            self.assertIn("● map the migration · Running · seat3 · planning", rendered)
 
     def test_background_work_rows_counts_and_ledger_deduplication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -445,10 +445,10 @@ class DisplayTests(unittest.TestCase):
                 rendered = dashboard(root, settings, [], color=False, width=140)
 
             self.assertIn("ONGOING WORK", rendered)
-            self.assertIn("Jobs 1 running, 1 queued, 1 waiting", rendered)
-            self.assertIn("review bounded patch · Running · codex/seat3 · review/small", rendered)
-            self.assertIn("plan next step · Queued · claude · planning/big", rendered)
-            self.assertIn("wait for capacity · Waiting for capacity · auto", rendered)
+            self.assertIn("Running 1 · Queued 1 · Waiting 1", rendered)
+            self.assertIn("● review bounded patch · Running · codex/seat3 · review/small", rendered)
+            self.assertIn("○ plan next step · Queued · claude · planning/big", rendered)
+            self.assertIn("◐ wait for capacity · Waiting for capacity · auto", rendered)
             self.assertLess(
                 rendered.index("review bounded patch"),
                 rendered.index("plan next step"),
@@ -557,18 +557,15 @@ class DisplayTests(unittest.TestCase):
 
             self.assertTrue(all(len(line) <= 120 for line in normal.splitlines()))
             self.assertTrue(all(len(line) <= 80 for line in compact.splitlines()))
-            self.assertIn("ROLE SEAT (PLAN)", normal)
-            self.assertIn("LIMIT / RESET", normal)
-            self.assertIn("ACTIVITY", normal)
-            self.assertIn("FIT", normal)
-            self.assertNotIn("ROLE ACCOUNT CAPACITY", compact)
-            self.assertIn("limit weekly · reset 7d", compact)
-            self.assertEqual(compact.count("remaining"), 6)
-            self.assertIn("last ok 30s", normal)
+            for frame in (normal, compact):
+                self.assertRegex(frame, r"SEAT\s+5H LEFT\s+7D LEFT\s+RESET\s+STATUS\s+FIT\s+AGE")
+            self.assertIn("updated 30s ago", normal)
             self.assertIn("next 2m", normal)
-            self.assertIn("Seats ready 5/5", normal)
-            self.assertRegex(normal, r"W\s+seat5 \(Plus 1x\)\s+.*weekly · reset 7d")
-            self.assertRegex(normal, r"C\s+claude\s+.*7-day · reset 7d")
+            self.assertIn("Ready 6/6", normal)
+            self.assertEqual(len(re.findall(r"^[PDWC] ", compact, re.M)), 6)
+            self.assertRegex(normal, r"W seat5 Plus 1x\s+—\s+███████░░░  70%\s+7d\s+○ idle")
+            self.assertRegex(normal, r"C claude tier \?\s+███████▌░░  75%\s+██████░░░░  60%\s+7d\s")
+            self.assertRegex(compact, r"W seat5 Plus 1x\s+—\s+███▌░  70%\s+7d\s+○ idle")
 
     def test_remaining_capacity_names_only_the_binding_reported_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -594,9 +591,8 @@ class DisplayTests(unittest.TestCase):
             seat_line = next(
                 line for line in rendered.splitlines() if re.match(r"^P\s+seat1", line)
             )
-            self.assertIn("25%", seat_line)
-            self.assertIn("5-hour · reset 2h", seat_line)
-            self.assertNotIn("weekly", seat_line)
+            # Both windows are visible; RESET follows the binding (5-hour) window.
+            self.assertRegex(seat_line, r"██▌░░░░░░░  25%\s+████████░░  80%\s+2h\s")
 
     def test_narrow_layout_prioritizes_current_work_without_cryptic_background_labels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -615,11 +611,48 @@ class DisplayTests(unittest.TestCase):
             rendered = dashboard(
                 root, settings, [], color=False, width=50, height=14, at=current
             )
-            self.assertIn("seat1 (Plus 1x) (P) · ready · 90% remaining · Run", rendered)
+            self.assertIn("P seat1 Plus 1x", rendered)
+            self.assertRegex(rendered, r"P seat1 Plus 1x\s+7d ████▌  90%  ● repair")
             self.assertIn("ONGOING WORK", rendered)
             self.assertNotIn("BACKGROUND WORK", rendered)
             self.assertNotIn(" BG ", rendered)
             self.assertTrue(all(self.display_width(line) <= 50 for line in rendered.splitlines()))
+
+    def test_every_width_fits_and_colour_only_adds_escapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = write_settings(root, registry_settings())
+            current = 1_784_250_000.0
+            self.healthy_pool(root, settings, current)
+            with Ledger(root) as data:
+                data["seats"]["seat1"]["last_probe_limits"]["5h"] = {
+                    "pct": 12.5,
+                    "resets_at": current + 3 * 3600,
+                    "window_minutes": 300,
+                }
+                data["seats"]["seat2"]["probed_at"] = iso(current - 11 * 3600)
+                data["seats"]["seat2"]["usage_updated_at"] = iso(current - 11 * 3600)
+            # 100–106 columns once overflowed through the AGE column.
+            for width in range(20, 161):
+                plain = dashboard(root, settings, [], color=False, width=width, at=current)
+                colored = dashboard(root, settings, [], color=True, width=width, at=current)
+                self.assertEqual(self.ansi.sub("", colored), plain, width)
+                self.assertTrue(
+                    all(self.display_width(line) <= width for line in plain.splitlines()),
+                    f"{width}\n{plain}",
+                )
+            wide = dashboard(root, settings, [], color=False, width=120, at=current)
+            # Threshold colours: seat1's 5-hour window is low, so its bar is red.
+            colored = dashboard(root, settings, [], color=True, width=120, at=current)
+            seat1 = next(line for line in colored.splitlines() if line.startswith("P seat1"))
+            self.assertIn("\033[38;2;255;85;85m█▎", seat1)
+            self.assertRegex(wide, r"P seat1 Plus 1x\s+█▎░+  12%\s+█████████░  90%\s+3h\s")
+            self.assertRegex(wide, r"W seat2 Plus 1x .*small\+big  11\.0h")
+            # Roles are primary and worker only; a legacy deputy reads as a worker.
+            self.assertNotRegex(wide, r"(?m)^D ")
+            self.assertIn("CODEX 5 · primary seat1 is used last", wide)
+            with mock.patch("codex_seats.display.derive_roles", return_value={"seat2": "deputy"}):
+                self.assertEqual(role_badges(settings)["seat2"], "W")
 
     def test_sparse_color_keeps_plain_symbols_and_never_wraps_a_row(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -632,9 +665,9 @@ class DisplayTests(unittest.TestCase):
             self.assertEqual(self.ansi.sub("", colored), plain)
             self.assertIn("█", plain)
             self.assertIn("○ idle", plain)
-            self.assertIn("Seats ready 5/5", plain)
+            self.assertIn("Ready 6/6", plain)
             disabled = dashboard(root, registry_settings(), [], color=False)
-            self.assertIn("· disabled", disabled)
+            self.assertIn("– off", disabled)
             disabled_line = next(
                 line for line in disabled.splitlines() if "claude" in line
             )
@@ -642,7 +675,7 @@ class DisplayTests(unittest.TestCase):
             provider_lines = [
                 line
                 for line in colored.splitlines()
-                if re.match(r"^(P|D|W|C)\s", line)
+                if re.match(r"^(P|W|C)\s", line)
             ]
             self.assertTrue(provider_lines)
             self.assertTrue(all(not line.startswith("\033[") for line in provider_lines))
@@ -688,14 +721,14 @@ class DisplayTests(unittest.TestCase):
             rendered = dashboard(root, settings, [], color=False, width=120, at=current)
             machine = json.loads(status_json(root, settings))
 
-            self.assertIn("Seats ready 2/5", rendered)
+            self.assertIn("Ready 3/6", rendered)
             fit_values = {
                 re.split(r"\s+", line.strip())[-2]
                 for line in rendered.splitlines()
-                if re.match(r"^(P|D|W)\s", line)
+                if re.match(r"^(P|W)\s", line)
             }
-            self.assertTrue({"S+B", "S", "B", "none"}.issubset(fit_values))
-            self.assertIn("× err", rendered)
+            self.assertTrue({"small+big", "small", "big", "none"}.issubset(fit_values))
+            self.assertIn("× needs sign-in", rendered)
             unhealthy_line = next(
                 line for line in rendered.splitlines() if "seat5" in line
             )
@@ -840,9 +873,10 @@ class DisplayTests(unittest.TestCase):
                 at=current,
             )
             self.assertIn("ATTENTION", rendered)
-            self.assertIn("seat1: authentication failed", rendered)
+            self.assertIn("! seat1 authentication failed · sign in again", rendered)
             self.assertIn("3 more (--forensic)", rendered)
-            self.assertIn("active refresh failed", rendered)
+            self.assertIn("The last refresh failed · check the result", rendered)
+            self.assertNotIn("Next:", rendered)
             self.assertIn("settings warning", rendered)
             forensic = dashboard(
                 root, settings, [], color=False, forensic=True, width=180,
@@ -878,7 +912,10 @@ class DisplayTests(unittest.TestCase):
                 at=current,
             )
 
-            self.assertIn("settings unknown keys: 2 preserved", normal)
+            self.assertIn(
+                "Settings file has 2 unrecognised keys (kept) · run dash --forensic to see them",
+                normal,
+            )
             self.assertNotIn("future_coordination_hint' was preserved", normal)
             self.assertIn("future_coordination_hint' was preserved", forensic)
             self.assertIn("projects.local.future_branch_policy' was preserved", forensic)
@@ -950,9 +987,11 @@ class DisplayTests(unittest.TestCase):
             self.assertIn("context ?", claude_active)
             self.assertNotIn("must not appear", rendered)
             self.assertIn("×2", rendered)
-            history_lines = rendered.split("HISTORY\n", 1)[1].splitlines()
+            history_lines = re.split(r"RECENT ─+ last 5 ──\n", rendered, maxsplit=1)[1].splitlines()
             self.assertEqual(len(history_lines), 5)
-            self.assertTrue(all("[gpt-test]" in line for line in history_lines))
+            self.assertTrue(all("gpt-test" in line for line in history_lines))
+            self.assertIn("× failed", rendered)
+            self.assertIn("! blocked", rendered)
             self.assertTrue(all(len(line) <= 160 for line in rendered.splitlines()))
 
     def test_forensic_retains_hidden_default_fields_at_compact_width(self):
@@ -1064,7 +1103,7 @@ class DisplayTests(unittest.TestCase):
             self.assertLessEqual(len(bounded.splitlines()), 22)
             self.assertIn("ATTENTION", bounded)
             self.assertIn("warning 0", bounded)
-            self.assertIn("ONGOING WORK\n  none", bounded)
+            self.assertRegex(bounded, r"ONGOING WORK ─+\n  none")
             self.assertIn("omitted", bounded)
 
     def test_claude_fit_matches_status_json_for_busy_and_unhealthy_states(self):
@@ -1083,11 +1122,11 @@ class DisplayTests(unittest.TestCase):
             busy_dashboard = dashboard(root, settings, [], color=False, width=120)
             busy_line = next(line for line in busy_dashboard.splitlines() if "claude" in line)
             expected = (
-                "S+B" if busy_status["fits_big"] else "S"
+                "small+big" if busy_status["fits_big"] else "small"
                 if busy_status["fits_small"] else "none"
             )
             self.assertIn(expected, busy_line)
-            self.assertIn("● review", busy_line)
+            self.assertIn("● busy but capacity", busy_line)
 
             with Ledger(root) as data:
                 data["providers"]["claude"].update(
@@ -1122,7 +1161,7 @@ class DisplayTests(unittest.TestCase):
             )
             self.assertFalse(unhealthy_status["fits_small"])
             self.assertFalse(unhealthy_status["fits_big"])
-            self.assertIn("× error", unhealthy_line)
+            self.assertIn("× needs sign-in", unhealthy_line)
             self.assertIn("—", unhealthy_line)
 
     def test_expired_claude_windows_are_not_displayed(self):
@@ -1222,7 +1261,11 @@ class LocalSeatDisplayTests(unittest.TestCase):
 
     @staticmethod
     def local_line(rendered: str, name: str) -> str:
-        return next(line for line in rendered.splitlines() if line.startswith(name))
+        # Rows are named "<model> on <host>"; tests address them as host/seat.
+        # Narrow layouts may clip the host, so match on the model.
+        _host, seat = name.split("/")
+        model = {"small": "qwen3.8-27b", "large": "qwen3.8-70b"}[seat]
+        return next(line for line in rendered.splitlines() if line.startswith(f"L {model} on"))
 
     def test_local_section_states_probe_age_history_label_and_no_writes(self):
         from codex_seats import local_seats
@@ -1246,17 +1289,14 @@ class LocalSeatDisplayTests(unittest.TestCase):
                 )
 
             # Never probed: the enabled seat is unknown, the off seat is off, and
-            # both remain listed. Frontier readiness excludes local seats.
+            # both remain listed. Ready counts enabled seats of every provider.
             unknown = dashboard(root, settings, [], color=False, width=120, at=current)
-            self.assertIn("LOCAL SEATS · ready 0/2 · global opportunistic", unknown)
-            self.assertIn("Seats ready 5/5", unknown)
+            self.assertIn("LOCAL 2 · ready 0/2 · global Opportunistic", unknown)
+            self.assertIn("Ready 6/7", unknown)
             small = self.local_line(unknown, "studio/small")
-            self.assertIn("qwen3.8-27b", small)
-            self.assertIn("opportunistic", small)
-            self.assertIn("? unknown", small)
+            self.assertRegex(small, r"L qwen3.8-27b on studio\s+—\s+—\s+—\s+◐ not probed")
             large = self.local_line(unknown, "studio/large")
-            self.assertIn("· off", large)
-            self.assertIn("seat mode off", large)
+            self.assertIn("– off", large)
             history = next(line for line in unknown.splitlines() if "local history job" in line)
             self.assertIn("L:small", history)
             self.assertNotIn(" ? ", history)
@@ -1269,11 +1309,11 @@ class LocalSeatDisplayTests(unittest.TestCase):
             before = self.filesystem_state(root)
             ready = dashboard(root, settings, [], color=False, width=120, at=current + 3)
             self.assertEqual(self.filesystem_state(root), before)
-            self.assertIn("LOCAL SEATS · ready 1/2", ready)
-            self.assertIn("Seats ready 5/5", ready)
+            self.assertIn("LOCAL 2 · ready 1/2", ready)
+            self.assertIn("Ready 7/7", ready)
             small = self.local_line(ready, "studio/small")
-            self.assertIn("○ available", small)
-            self.assertIn("GPU idle", small)
+            self.assertIn("○ ready", small)
+            self.assertNotIn("GPU idle", small)
             self.assertRegex(small, r"\b3s\b")
 
             # Working is asserted only for a running local job on that seat.
@@ -1291,24 +1331,27 @@ class LocalSeatDisplayTests(unittest.TestCase):
             ]
             with mock.patch("codex_seats.display.dispatch_client.live_jobs", return_value=jobs):
                 working = dashboard(root, settings, [], color=False, width=120, at=current + 3)
-            self.assertIn("● working", self.local_line(working, "studio/small"))
-            self.assertIn("local live work", self.local_line(working, "studio/small"))
+            self.assertIn("● local live work", self.local_line(working, "studio/small"))
             self.assertNotIn("working", self.local_line(working, "studio/large"))
             self.assertIn("local/small", working.split("ONGOING WORK", 1)[1])
 
             # An expired observation is stale with its age, not silently unknown.
             stale = dashboard(root, settings, [], color=False, width=120, at=current + 40)
             small = self.local_line(stale, "studio/small")
-            self.assertIn("~ stale", small)
+            self.assertIn("◐ stale 40s", small)
             self.assertIn("~40s", small)
-            self.assertIn("last ready", small)
+            self.assertIn(
+                "! Local seat qwen3.8-27b on studio has not been probed for 40s · probe its host",
+                stale,
+            )
 
             # Global off keeps every seat visible but off, without any probe I/O.
             settings["providers"]["local"]["mode"] = "off"
             off = dashboard(root, settings, [], color=False, width=120, at=current + 3)
-            self.assertIn("global off", off)
-            self.assertIn("global mode off", self.local_line(off, "studio/small"))
-            self.assertIn("· off", self.local_line(off, "studio/large"))
+            self.assertIn("global Off", off)
+            self.assertIn("– off", self.local_line(off, "studio/small"))
+            self.assertIn("– off", self.local_line(off, "studio/large"))
+            self.assertNotIn("Local seat", off)
             self.assertNotIn("ready", self.local_line(off, "studio/small"))
 
     def test_local_status_host_rows_share_seat_derivation(self):
@@ -1365,7 +1408,7 @@ class LocalSeatDisplayTests(unittest.TestCase):
             self.assertEqual((small["key"], small["detail"]), ("unknown", "configuration changed"))
             rendered = dashboard(root, settings, [], color=False, width=120, at=current + 3)
             line = self.local_line(rendered, "studio/small")
-            self.assertIn("? unknown", line)
+            self.assertIn("◐ not probed", line)
             self.assertNotIn("degraded", line)
             settings["local_hosts"]["studio"]["label"] = "Studio"
 
@@ -1393,7 +1436,7 @@ class LocalSeatDisplayTests(unittest.TestCase):
         for output, expected in (
             ('{"state":"gaming","detail":"GPU busy with a game"}', "◐ gaming"),
             ('{"state":"asleep"}', "○ asleep"),
-            ('{"state":"loading"}', "↻ loading"),
+            ('{"state":"loading"}', "◐ loading"),
             ('{"state":"busy"}', "◐ busy"),
             ('{"state":"degraded","detail":"service down"}', "× degraded"),
             ("not json", "× degraded"),
@@ -1407,11 +1450,16 @@ class LocalSeatDisplayTests(unittest.TestCase):
                 rendered = dashboard(root, settings, [], color=False, width=120, at=current + 2)
                 small = self.local_line(rendered, "studio/small")
                 self.assertIn(expected, small)
-                self.assertIn("LOCAL SEATS · ready 0/2", rendered)
+                self.assertIn("LOCAL 2 · ready 0/2", rendered)
                 if output == "not json":
-                    self.assertIn("probe_invalid_output", small)
-                elif "GPU busy" in output:
-                    self.assertIn("GPU busy with a game", small)
+                    self.assertIn(
+                        "! Local seat qwen3.8-27b on studio is degraded: probe output invalid",
+                        rendered,
+                    )
+                elif "service down" in output:
+                    self.assertIn("is degraded: service down · check the host", rendered)
+                else:
+                    self.assertNotIn("Local seat", rendered)
 
     def test_local_section_fits_narrow_widths_and_is_height_bounded_first(self):
         from codex_seats import local_seats
@@ -1432,9 +1480,9 @@ class LocalSeatDisplayTests(unittest.TestCase):
 
             for width in (90, 50):
                 rendered = dashboard(root, settings, [], color=False, width=width, at=current + 3)
-                self.assertIn("LOCAL SEATS", rendered)
-                self.assertIn("studio/small", rendered)
-                self.assertIn("available", self.local_line(rendered, "studio/small"))
+                self.assertIn("LOCAL 2", rendered)
+                self.assertIn("L qwen3.8-27b on", rendered)
+                self.assertIn("○ ready", self.local_line(rendered, "studio/small"))
                 self.assertIn("off", self.local_line(rendered, "studio/large"))
                 self.assertTrue(
                     all(DisplayTests.display_width(line) <= width for line in rendered.splitlines()),
@@ -1447,14 +1495,14 @@ class LocalSeatDisplayTests(unittest.TestCase):
             self.assertIn("global opportunistic, seat opportunistic", forensic)
 
             unbounded = dashboard(root, settings, [], color=False, width=120, at=current + 3)
-            self.assertIn("LOCAL SEATS", unbounded)
+            self.assertIn("LOCAL 2", unbounded)
             bounded = dashboard(
                 root, settings, [], color=False, width=120, height=13, at=current + 3
             )
             self.assertLessEqual(len(bounded.splitlines()), 13)
             self.assertIn("ONGOING WORK", bounded)
             self.assertIn("visible live work", bounded)
-            self.assertNotIn("LOCAL SEATS", bounded)
+            self.assertNotIn("LOCAL 2", bounded)
             self.assertIn("omitted", bounded)
 
 

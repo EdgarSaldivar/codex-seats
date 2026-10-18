@@ -44,6 +44,7 @@ codex-seat delegate --mcp visual "inspect X" # named, committed MCP grant
 codex-seat delegate --kind ui_ux --effort max --override-reason "high-stakes interaction"
 codex-seat delegate --detach "…"           # print a job id, don't wait
 codex-seat await <job-id> [<job-id>…]       # one blocking wait for detached jobs
+codex-seat capacity --json                 # where work can run now (read-only)
 codex-seat job list [--json]                # one sanitized queue/runner snapshot
 codex-seat job list --watch                 # event-driven terminal redraw on transitions
 ```
@@ -82,11 +83,14 @@ sequences: the initial snapshot is printed once, then only meaningful transition
 appended. Volatile clock, age, elapsed, and next-countdown changes alone do not append a
 new snapshot; quota, activity, FIT, job, attention, and refresh-result changes do.
 
-Outside a head/controller, press `m` in this same watch for preview-first seat
-management (`?` help, `q` quit), or run `codex-seat dash --manage`. Management is
-intentionally refused inside either head and inside managed workers even when a PTY
-is present. See the [terminal seat manager](terminal-seat-manager.md) for actions,
-drain semantics, login handoff, and settings forms.
+In a normal terminal, press `m` in this same watch for seat management (`?` help,
+`q` quit), or run `codex-seat dash --manage`, which also works for a human in a
+head pane with a real terminal. Heads manage the pool from their command tool
+instead: `codex-seat capacity --json` shows where work can run, and
+`codex-seat seats pause|resume|refresh` and `codex-seat provider claude set`
+apply light changes; see the [agent guide](agents.md). Management is refused only
+inside managed workers. See the [terminal seat manager](terminal-seat-manager.md)
+for actions, drain semantics, login handoff, and settings forms.
 
 Every terminal worker artifact with a nonempty diff or changed-file set is also published
 as a durable ChangeSet keyed by that validated job id. The runner atomically stores a
@@ -246,9 +250,11 @@ separate restrictions on the `dispatch/` tree and runner LaunchAgent.
 
 ## Seat routing
 
-- The **Codex head defaults to the configured primary**. “Primary” means default
-  interactive/control identity; it does not mean spend-last. A terminal head may
-  select another active authenticated identity with `--seat N`.
+- The **Codex head defaults to the configured primary**. “Primary” is the default
+  interactive/control identity, and routing spends it last: delegated work goes to
+  any fitting worker seat first and uses the primary only when no worker fits.
+  Seats have two roles, primary and worker. A terminal head may select another
+  active authenticated identity with `--seat N`.
 - The selected Codex head seat is held out of ordinary delegated-worker selection. If all
   ordinary worker capacity is unavailable, the controller may reuse that identity for a
   fresh isolated managed-worker call when `execution.head_worker_fallback` is enabled.
@@ -259,12 +265,12 @@ separate restrictions on the `dispatch/` tree and runner LaunchAgent.
 - The **Claude head** consumes no Codex identity, so every active, healthy,
   capacity-eligible Codex identity may be a worker. If those identities are exhausted,
   Claude itself may be used as the isolated last-resort worker when policy and quota allow.
-- Protection comes from active-head exclusion and explicit per-seat reserves,
-  never implicit primary-role priority. For the documented two-seat target, a
+- Protection comes from active-head exclusion, explicit per-seat reserves, and
+  spending the primary last. For the documented two-seat target, a
   Premium Codex head leaves Standard as one Codex worker; a Claude head leaves
   Premium and Standard available as two Codex workers. Actual admission remains
   bounded by health, authoritative capacity, claims, passive Claude limits, and
-  the global safety ceiling of three. Within the Codex registry, 1x rolling identities
+  the global safety ceiling of three. Within the Codex workers, 1x rolling identities
   drain before 5x and future higher capacity classes; after 1x is unavailable, authoring
   prefers the family opposite the current head so final acceptance remains cross-family.
 

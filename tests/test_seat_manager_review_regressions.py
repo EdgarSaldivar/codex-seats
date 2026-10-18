@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_seats.seat_manager_tui import CAPACITY_PARTS, ManagerUI
+from codex_seats.seat_manager_tui import CAPACITY_PARTS, MARKER, ManagerUI
 from test_seat_manager_tui import _FakeManager, _frontier_ui, _preview
 
 
@@ -12,7 +12,7 @@ from test_seat_manager_tui import _FakeManager, _frontier_ui, _preview
 def test_capacity_text_does_not_trigger_navigation_or_quit(index, text):
     ui = ManagerUI(_FakeManager(), direct=True)
     ui.selected_id = 'seat1'
-    ui.view = 'capacity-input'
+    ui._push('capacity-input')
     ui.capacity_index = index
     ui.capacity_buffers = {option: '' for _, option in CAPACITY_PARTS}
     for character in text:
@@ -33,7 +33,7 @@ def test_selected_seat_remains_visible_in_a_short_long_list():
         ui.handle('down')
     frame = ui.render(80, 8, 'overview')
     assert ui.selected_id == 'seat14'
-    assert '> seat14' in frame
+    assert f'{MARKER} W seat14' in frame
     assert len(frame.splitlines()) <= 8
 
 
@@ -43,6 +43,7 @@ def test_cancel_after_checks_finish_prevents_activation_commit():
     manager.commit_activation = lambda *args: commits.append(args)
     ui = ManagerUI(manager, direct=True)
     ui.selected_id = 'seat1'
+    ui.confirm_return_view = 'list'
     ui.view = 'busy'
     ui.preview = replace(_preview(), action='activate')
     ui.activation_thread = SimpleNamespace(is_alive=lambda: False)

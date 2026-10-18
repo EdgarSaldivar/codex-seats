@@ -449,12 +449,19 @@ def test_cmd_job_status_has_stable_success_and_unknown_exits(tmp_path, capsys):
     )
     args = argparse.Namespace(job_action="status", job_id=known, json=True)
     assert dispatch_cli.cmd_job(args, {}, tmp_path) == dispatch_cli.EXIT_SUCCESS
-    assert json.loads(capsys.readouterr().out)["state"] == "completed"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == 1 and payload["ok"] is True
+    assert payload["data"]["state"] == "completed"
 
     unknown = dispatch_protocol.new_request_id()
     args = argparse.Namespace(job_action="status", job_id=unknown, json=False)
     assert dispatch_cli.cmd_job(args, {}, tmp_path) == dispatch_cli.EXIT_UNKNOWN
     assert capsys.readouterr().out.strip().endswith("unknown")
+    args.json = True
+    assert dispatch_cli.cmd_job(args, {}, tmp_path) == dispatch_cli.EXIT_UNKNOWN
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False and payload["error"]["code"] == "unknown-job"
+    assert payload["data"]["state"] == "unknown"
 
 
 def test_cmd_job_cancel_maps_unknown_and_errors_to_stable_exits(
@@ -606,7 +613,9 @@ def test_job_list_json_and_human_output_are_sanitized_and_stable(
     monkeypatch.setattr(dispatch_client, "live_jobs", lambda *_args: jobs)
     json_args = argparse.Namespace(job_action="list", json=True)
     assert dispatch_cli.cmd_job(json_args, {}, tmp_path) == 0
-    assert json.loads(capsys.readouterr().out) == jobs
+    assert json.loads(capsys.readouterr().out) == {
+        "schema": 1, "ok": True, "data": {"jobs": jobs},
+    }
 
     human_args = argparse.Namespace(job_action="list", json=False)
     assert dispatch_cli.cmd_job(human_args, {}, tmp_path) == 0
@@ -649,7 +658,8 @@ def test_job_list_watch_is_tty_only_redraws_transitions_and_rejects_json(
 
     args.json = True
     assert dispatch_cli.cmd_job(args, settings, tmp_path) == 2
-    assert "cannot be combined" in capsys.readouterr().err
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "dispatch-error" and "cannot be combined" in error["message"]
 
     args.json = False
     monkeypatch.setattr(dispatch_cli.sys.stdout, "isatty", lambda: False)

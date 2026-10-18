@@ -30,7 +30,7 @@ from codex_seats.state import (
     task_min_headroom,
     usable_headroom,
 )
-from codex_seats.policy_settings import policy_report
+from codex_seats.policy_settings import apply_policy, policy_report, preview_policy
 from codex_seats.seat_selection import pick_seat
 from registry_fixture import registry_settings, write_settings
 
@@ -47,9 +47,7 @@ def test_corrupt_settings_never_synthesize_legacy_capacity(tmp_path):
 
 def test_orchestration_defaults_ignore_obsolete_probe_mode(tmp_path):
     settings = default_settings()
-    assert settings["ui"] == {
-        "theme": "system", "density": "comfortable", "accent": "teal",
-    }
+    assert "ui" not in settings
     assert "pool.probe_mode" not in policy_report(settings)
     assert policy_report(settings)["execution.head_worker_fallback"] is True
     settings["pool"]["probe_mode"] = "terminal"
@@ -57,6 +55,22 @@ def test_orchestration_defaults_ignore_obsolete_probe_mode(tmp_path):
     loaded, warnings = load_settings(tmp_path)
     assert policy_report(loaded) == policy_report(default_settings())
     assert any("unknown setting 'pool.probe_mode'" in warning for warning in warnings)
+
+
+def test_legacy_ui_section_loads_and_survives_policy_writes_without_warnings(tmp_path):
+    settings = default_settings()
+    legacy = {"theme": "dark", "density": "compact", "accent": "indigo"}
+    settings["ui"] = legacy
+    (tmp_path / "settings.json").write_text(json.dumps(settings) + "\n")
+    loaded, warnings = load_settings(tmp_path)
+    assert warnings == []
+    assert policy_report(loaded) == policy_report(default_settings())
+    with mock.patch.dict(os.environ, {"CODEX_SEATS_MANAGED_WORKER": "0"}):
+        assert apply_policy(tmp_path, preview_policy(tmp_path, {"review.mode": "advisory"}))
+    written = json.loads((tmp_path / "settings.json").read_text())
+    assert written["review"]["mode"] == "advisory"
+    assert written["ui"] == legacy
+    assert load_settings(tmp_path)[1] == []
 
 
 def _hold_ledger_write(root: str, entered, release) -> None:
@@ -92,7 +106,7 @@ class SettingsTests(unittest.TestCase):
         settings["pool"]["seats"]["seat11"]["lifecycle"] = "draining"
         roles = seat_roles(settings)
         self.assertEqual(roles["seat1"], "primary")
-        self.assertEqual(roles["seat2"], "deputy")
+        self.assertEqual(roles["seat2"], "worker")
         self.assertEqual(roles["seat12"], "worker")
         self.assertNotIn("seat11", roles)
         self.assertEqual(len(roles), 11)
@@ -316,12 +330,12 @@ class SettingsTests(unittest.TestCase):
 
     def test_future_schema_and_conflicting_roles_fail_closed(self):
         conflicting = registry_settings(2)
-        conflicting["pool"]["deputy"] = "seat1"
+        conflicting["pool"]["primary"] = "seat9"
         unknown_reserve = registry_settings(2)
         unknown_reserve["pool"]["reserves_pct"] = {"seat9": 5}
         for raw, expected in (
             ({"schema": 4}, "unsupported settings schema 4"),
-            (conflicting, "pool.deputy must be distinct from pool.primary"),
+            (conflicting, "pool.primary must name an active registered seat"),
             (unknown_reserve, "pool.reserves_pct has unknown seat id 'seat9'"),
             ({"schema": 3, "pool": {"small_task_min_headroom_pct": True}},
              "pool.small_task_min_headroom_pct must be a percentage"),

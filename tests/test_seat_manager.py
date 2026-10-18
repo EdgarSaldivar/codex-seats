@@ -22,7 +22,9 @@ from codex_seats.seat_manager import (
     ManagerEligibilityError,
     SeatManager,
     StalePreviewError,
+    ensure_interactive_terminal,
     ensure_management_eligible,
+    ensure_not_managed_worker,
 )
 from codex_seats.runtime_readers import SettingsReader, settings_identity
 from codex_seats.seat_registry import CAPACITY_PLAN_PRESETS
@@ -106,11 +108,18 @@ def test_eligibility_rejects_managed_worker(monkeypatch) -> None:
         )
 
 
-def test_eligibility_rejects_head(monkeypatch) -> None:
-    with pytest.raises(ManagerEligibilityError, match="controller/head"):
-        ensure_management_eligible(
-            stdin=_Tty(), stdout=_Tty(), env={"CODEX_SEATS_HEAD": "claude"}
-        )
+def test_interactive_manager_allows_a_head_with_a_real_terminal() -> None:
+    for env in ({"CODEX_SEATS_HEAD": "claude"}, {"CODEX_CONTROL_SEAT": "seat1"}):
+        ensure_interactive_terminal(stdin=_Tty(), stdout=_Tty(), env=env)
+    assert ensure_management_eligible is ensure_interactive_terminal
+
+
+def test_mutation_check_refuses_only_managed_workers() -> None:
+    for env in ({}, {"CODEX_SEATS_HEAD": "codex"}, {"CODEX_CONTROL_SEAT": "seat1"}):
+        ensure_not_managed_worker(env=env)
+    for env in ({"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}):
+        with pytest.raises(ManagerEligibilityError, match="managed workers"):
+            ensure_not_managed_worker(env=env)
 
 
 def test_eligibility_allows_real_terminal_outside_excluded_contexts() -> None:
@@ -300,11 +309,13 @@ def test_set_role_preview_and_commit(tmp_path: Path, monkeypatch) -> None:
     _activate(tmp_path, seat2, as_primary=False)
     manager = _manager(tmp_path)
 
-    preview = manager.preview_set_role(seat2, "deputy")
+    with pytest.raises(seat_manager.ManagerError, match="deputy role was removed"):
+        manager.preview_set_role(seat2, "deputy")
+    preview = manager.preview_set_role(seat2, "primary")
     manager.commit(preview)
 
     current = json.loads((tmp_path / "settings.json").read_text())
-    assert current["pool"]["deputy"] == seat2
+    assert current["pool"]["primary"] == seat2
 
 
 @pytest.mark.parametrize(
@@ -1072,7 +1083,7 @@ def test_local_commit_digest_is_checked_inside_the_settings_lock(
     assert current["providers"]["local"]["mode"] == "opportunistic"
 
 
-def test_local_manager_refuses_excluded_contexts_even_with_pty(
+def test_local_manager_refuses_managed_workers_even_with_pty(
     tmp_path: Path, monkeypatch
 ) -> None:
     _human_terminal(monkeypatch)
@@ -1083,14 +1094,7 @@ def test_local_manager_refuses_excluded_contexts_even_with_pty(
     refresher = _FakeRefresher()
     manager = LocalSeatManager(tmp_path, refresher=refresher, clock=lambda: NOW)
     preview = manager.preview_seat_mode("small", "off")
-    contexts = (
-        {"CODEX_CONTROL_SEAT": "seat1"},
-        {"CODEX_SEATS_HEAD": "claude"},
-        {"CODEX_SEATS_HEAD": "codex"},
-        {"CODEX_THREAD_ID": "t1", "CODEX_HOME": str(tmp_path)},
-        {"CODEX_SEATS_MANAGED_WORKER": "1"},
-    )
-    for env in contexts:
+    for env in ({"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}):
         with monkeypatch.context() as patch:
             for name, value in env.items():
                 patch.setenv(name, value)
@@ -1098,18 +1102,12 @@ def test_local_manager_refuses_excluded_contexts_even_with_pty(
                 manager.commit(preview, from_current_user_request=True)
             with pytest.raises(ManagerEligibilityError):
                 manager.request_probe("studio")
-    with monkeypatch.context() as patch:
-        patch.setattr(sys.stdin, "isatty", lambda: False)
-        with pytest.raises(ManagerEligibilityError, match="terminal"):
-            manager.commit(preview, from_current_user_request=True)
-        with pytest.raises(ManagerEligibilityError, match="terminal"):
-            manager.request_probe("studio")
     # Defense in depth: even with the manager's own pre-check bypassed, the
-    # write layer's distinct manager authority still refuses excluded contexts.
+    # write layer's distinct manager authority still refuses a managed worker.
     with monkeypatch.context() as patch:
         patch.setattr(manager, "_authorize", lambda action: None)
-        patch.setenv("CODEX_CONTROL_SEAT", "seat1")
-        with pytest.raises(ManagerEligibilityError, match="controller/head"):
+        patch.setenv("CLAUDE_LEAD_WORKER", "1")
+        with pytest.raises(ManagerEligibilityError, match="managed workers"):
             manager.commit(preview, from_current_user_request=True)
     assert refresher.requests == []
     assert path.read_bytes() == original
@@ -1117,8 +1115,13 @@ def test_local_manager_refuses_excluded_contexts_even_with_pty(
     with monkeypatch.context() as patch:
         patch.setenv("CODEX_SEATS_MANAGED_WORKER", "1")
         assert manager.report()["global_mode"] == "opportunistic"
-    # And the eligible human terminal succeeds.
-    assert manager.commit(preview, from_current_user_request=True).changed
+    # A head without a terminal may write and queue probes.
+    with monkeypatch.context() as patch:
+        patch.setenv("CODEX_SEATS_HEAD", "claude")
+        patch.setattr(sys.stdin, "isatty", lambda: False)
+        assert manager.commit(preview, from_current_user_request=True).changed
+        manager.request_probe("studio")
+    assert refresher.requests == ["studio"]
     assert json.loads(path.read_text())["local_seats"]["small"]["mode"] == "off"
 
 
@@ -1255,7 +1258,7 @@ def test_local_remove_seat_retires_a_tombstone_behind_every_guard(
     with pytest.raises(seat_manager.ManagerError, match="explicit confirmation"):
         manager.commit(preview, from_current_user_request=False)
     with monkeypatch.context() as patch:
-        patch.setenv("CODEX_CONTROL_SEAT", "seat1")
+        patch.setenv("CODEX_SEATS_MANAGED_WORKER", "1")
         with pytest.raises(ManagerEligibilityError):
             manager.commit(preview, from_current_user_request=True)
     assert path.read_bytes() == before

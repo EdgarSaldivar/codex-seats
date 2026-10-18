@@ -56,7 +56,7 @@ from .seat_manager import (
     StalePreviewError,
     _freeze,
     _thaw,
-    ensure_management_eligible,
+    ensure_not_managed_worker,
 )
 
 # Known consumer/organization plan labels, in display form.
@@ -396,9 +396,8 @@ class ClaudeAccountManager:
     ) -> ClaudeAccountMutationResult:
         """Apply a previewed edit with the explicit confirmation marker.
 
-        Refused after close, for controller/head and managed-worker contexts
-        (even on a PTY), without a real TTY, and without
-        ``from_current_user_request=True``. The edit is re-applied inside the
+        Refused after close, for managed workers, and without
+        ``from_current_user_request=True``; heads and plain shells may apply. The edit is re-applied inside the
         settings lock only if the file still matches ``preview.expected_digest``.
         """
         with self._lock:
@@ -411,7 +410,7 @@ class ClaudeAccountManager:
                     "Claude account edits require explicit confirmation of the current request"
                 )
             try:
-                ensure_management_eligible()
+                ensure_not_managed_worker()
             except ManagerEligibilityError as exc:
                 raise ManagerEligibilityError(f"Claude account edit refused: {exc}") from exc
             changes = _thaw(preview.changes)

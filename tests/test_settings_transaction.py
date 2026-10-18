@@ -31,7 +31,7 @@ def test_shared_transaction_validates_schema_three_and_preserves_unknowns(
     raw: dict[str, object] = {
         "schema": 3,
         "future": {"preserved": 3},
-        "pool": {"primary": None, "deputy": None, "seats": {}},
+        "pool": {"primary": None, "seats": {}},
     }
     _write_settings(tmp_path, raw)
 

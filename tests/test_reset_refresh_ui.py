@@ -16,7 +16,7 @@ from test_seat_manager_tui import _FakeManager
 
 
 def test_claude_sidecar_off_missing_tmux_and_fake_usage(tmp_path, monkeypatch):
-    settings = registry_settings(["seat1"], deputy=None)
+    settings = registry_settings(["seat1"])
     cancel = threading.Event()
     calls = []
     monkeypatch.setattr("codex_seats.claude_usage_sidecar._tmux",
@@ -52,7 +52,7 @@ def test_claude_sidecar_off_missing_tmux_and_fake_usage(tmp_path, monkeypatch):
 
 
 def test_claude_sidecar_settings_are_isolated_and_cleaned(tmp_path):
-    sidecar = ClaudeUsageSidecar(tmp_path, registry_settings(["seat1"], deputy=None), threading.Event())
+    sidecar = ClaudeUsageSidecar(tmp_path, registry_settings(["seat1"]), threading.Event())
     settings_path, mcp_path = sidecar._write_settings()
     config = json.loads(settings_path.read_text())
     assert sys.executable in config["statusLine"]["command"]
@@ -64,7 +64,7 @@ def test_claude_sidecar_settings_are_isolated_and_cleaned(tmp_path):
 
 
 def test_claude_sidecar_child_env_is_allowlisted_and_failure_cleans_up(tmp_path, monkeypatch):
-    settings = registry_settings(["seat1"], deputy=None)
+    settings = registry_settings(["seat1"])
     settings["providers"]["claude"]["mode"] = "manual_only"
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-secret")
     monkeypatch.setenv("CODEX_SESSION_ID", "synthetic-session")
@@ -96,7 +96,7 @@ def test_claude_sidecar_child_env_is_allowlisted_and_failure_cleans_up(tmp_path,
 
 
 def test_watch_claude_gate_and_shared_lock(tmp_path):
-    settings = registry_settings(["seat1"], deputy=None)
+    settings = registry_settings(["seat1"])
     settings["providers"]["claude"]["mode"] = "manual_only"
     sidecar = mock.Mock()
     sidecar.probe.return_value = (False, "synthetic usage failure")
@@ -118,7 +118,7 @@ def test_watch_claude_gate_and_shared_lock(tmp_path):
 
 
 def test_claude_refresh_setting_previews_in_existing_account(tmp_path):
-    settings = registry_settings(["seat1"], deputy=None)
+    settings = registry_settings(["seat1"])
     write_settings(tmp_path, settings)
     manager = ClaudeAccountManager(tmp_path)
     assert manager.report()["active_usage_refresh"] is True
@@ -129,9 +129,9 @@ def test_claude_refresh_setting_previews_in_existing_account(tmp_path):
 def test_tui_preview_cancel_confirm_poll_is_background(tmp_path, monkeypatch):
     manager = _FakeManager()
     manager.root = Path(tmp_path)
-    ui = ManagerUI(manager)
+    ui = ManagerUI(manager, direct=True)
     ui.selected_id = "seat1"
-    ui.view = "actions"
+    ui._push("actions")
     preview = {"seat": "seat1", "home": "/fake/seat1", "provider_identity": '{"email":"one@example.test"}',
                "available_count": 1, "credit": {"fingerprint": "abc", "title": "One reset",
                "granted_at": 1, "expires_at": 2}}
@@ -140,19 +140,21 @@ def test_tui_preview_cancel_confirm_poll_is_background(tmp_path, monkeypatch):
                         lambda *_a, **_k: calls.append("preview") or preview)
     monkeypatch.setattr("codex_seats.seat_manager_tui.redeem_banked_reset",
                         lambda *_a, **_k: calls.append("redeem") or {"outcome": "reset", "refresh_error": None})
-    assert any(action == "redeem-reset" for _label, action in ui._actions())
-    ui._choose_action("redeem-reset")
+    assert any(action.action == "redeem" and not action.reason for action in ui._menu_actions())
+    ui.handle("c")
     assert ui.view == "busy"
     ui.reset_thread.join(2)
     assert ui.poll() and ui.view == "confirm"
-    assert "One reset" in "\n".join(ui._preview_material())
+    ui.handle("d")
+    assert "One reset" in ui.render(100, 30, "")
     ui.handle("esc")
-    assert calls == ["preview"] and ui.reset_preview is None
-    ui._choose_action("redeem-reset")
+    assert calls == ["preview"] and ui.reset_preview is None and ui.view == "actions"
+    ui.handle("c")
     ui.reset_thread.join(2)
     ui.poll()
     ui.handle("enter")
     assert ui.view == "busy"
     ui.reset_thread.join(2)
-    assert ui.poll() and ui.view == "message"
+    assert ui.poll() and ui.view == "actions"
+    assert "Reset outcome: reset" in ui.message
     assert calls == ["preview", "preview", "redeem"]

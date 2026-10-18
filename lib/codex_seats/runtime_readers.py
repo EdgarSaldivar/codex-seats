@@ -62,7 +62,6 @@ def settings_identity(settings: Mapping[str, Any]) -> dict[str, Any]:
     # Registry identity intentionally excludes every non-topology settings section.
     registry = {
         "primary": pool.get("primary"),
-        "deputy": pool.get("deputy"),
         "seats": seats,
     }
     return {

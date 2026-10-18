@@ -632,7 +632,8 @@ def manager_identity_report(
         cached = dict(cached) if isinstance(cached, dict) else {}
     fingerprint = _auth_file_fingerprint(runtime_seat_home(root, seat_id, settings))
     observed = cached.get("observed_at")
-    observed = float(observed) if isinstance(observed, (int, float)) else None
+    observed = (float(observed) if isinstance(observed, (int, float))
+                and not isinstance(observed, bool) and math.isfinite(observed) else None)
 
     def unavailable(status: str, reason: str) -> dict[str, Any]:
         return {
@@ -649,7 +650,10 @@ def manager_identity_report(
     status = cached.get("status") if cached.get("status") in {"fresh", "stale"} else "unavailable"
     reason = _identity_text(cached.get("reason"), 256)
     stale_seconds = float(settings.get("pool", {}).get("probe_stale_seconds", 6 * 3600))
-    if status == "fresh" and observed is not None and time.time() - observed > stale_seconds:
+    current = time.time()
+    # A fresh claim needs a trustworthy timestamp: missing or future means stale.
+    if status == "fresh" and (observed is None or observed > current
+                              or current - observed > stale_seconds):
         status = "stale"
         reason = "identity verification is older than the refresh freshness window"
     return {

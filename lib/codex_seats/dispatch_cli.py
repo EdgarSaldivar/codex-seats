@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import dispatch_client, remote_wake
+from . import agent_json, dispatch_client, remote_wake
 from .controller_context import current_controller
 from .dispatch_protocol import DispatchError
 from .efforts import EFFORTS
@@ -431,7 +431,7 @@ def cmd_job(args, settings, root) -> int:
                 return _watch_jobs(root, settings)
             jobs = dispatch_client.live_jobs(root, settings)
             if args.json:
-                print(json.dumps(jobs))
+                return agent_json.emit_success({"jobs": jobs})
             else:
                 for line in _job_lines(jobs):
                     print(line)
@@ -440,7 +440,12 @@ def cmd_job(args, settings, root) -> int:
         if args.job_action == "status":
             result = dispatch_client.job_status(root, args.job_id)
             if args.json:
-                print(json.dumps(result))
+                if result["state"] == "unknown":
+                    return agent_json.emit_failure(
+                        "unknown-job", f"no durable record of job {args.job_id}",
+                        EXIT_UNKNOWN, data=result,
+                    )
+                return agent_json.emit_success(result)
             else:
                 print(f"{result['request_id']} {result['state']}")
             return EXIT_UNKNOWN if result["state"] == "unknown" else EXIT_SUCCESS
@@ -493,5 +498,7 @@ def cmd_job(args, settings, root) -> int:
             return EXIT_UNKNOWN
         return EXIT_SUCCESS
     except (DispatchError, TimeoutError, OSError) as exc:
+        if args.json and args.job_action in {"list", "status"}:
+            return agent_json.emit_failure("dispatch-error", str(exc), EXIT_ERROR)
         print(str(exc), file=sys.stderr)
         return EXIT_ERROR

@@ -314,7 +314,7 @@ def _dispatch_auto_authoring(
 ) -> RunResult:
     """Run the authoring state machine for a typed interactive-head request.
 
-    1. Spend eligible Codex 1x rolling seats.
+    1. Spend eligible Codex 1x rolling worker seats (never the primary).
     2. Prefer the family opposite the current head.
     3. Use the remaining same-family pool.
     4. As a last resort, run an isolated worker on the active head identity.
@@ -342,7 +342,11 @@ def _dispatch_auto_authoring(
     one_x["no_queue"] = True
     one_x["route_provider"] = "codex"
     one_x["route_reason"] = "router:phase1-codex-1x"
-    one_x["_excluded_seats"] = sorted(base_excluded | _non_one_x_seats(settings))
+    # Phase 1 spends 1x workers only; the primary drains last (phase 3 pick).
+    primary = settings.get("pool", {}).get("primary")
+    one_x["_excluded_seats"] = sorted(
+        base_excluded | _non_one_x_seats(settings) | ({primary} if primary else set())
+    )
     result = run_codex(root, settings, one_x, access_decision=access_decision)
     if not _codex_pool_exhausted(result):
         return result

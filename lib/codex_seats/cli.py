@@ -36,7 +36,6 @@ from .state import (
     effective_claude_mode,
     load_claude_rate_limits,
     load_settings,
-    read_pool_snapshot,
     refresh_transients,
     runtime_seat_home,
     set_claude_mode,
@@ -49,7 +48,6 @@ from .seat_registry import (
     seat_number,
 )
 from .task_policy import TASK_KINDS
-from .telemetry import refresh_passive_usage
 from .worker_config import sync_codex_config
 from .workers import (
     codex_version,
@@ -132,22 +130,69 @@ def cmd_pick_seat(args: argparse.Namespace, settings: dict[str, Any]) -> int:
     cross-model review gate, the spec red-team, an interactive launcher — get the SAME
     seat selection the build head gets, instead of hard-coding a seat or the default
     home. Does not claim the seat (reviews are short/read-only); exit 0 with a seat,
-    exit 3 when the pool is exhausted so a caller can branch to a provider fallback."""
+    exit 3 when the pool is exhausted so a caller can branch to a provider fallback.
+    ``--json`` wraps the same answer in the agent envelope with the same exit codes."""
+    from . import agent_json
+    from .pool_view import read_snapshot
     from .seat_selection import pick_seat
     from .state import default_task_size
 
     kind = args.kind
     size = args.size or default_task_size(settings, kind)
+    as_json = bool(getattr(args, "json", False))
     try:
-        data = read_pool_snapshot(ROOT)
-        refresh_transients(data, ROOT, settings)
-        refresh_passive_usage(data, ROOT, settings)
+        data = read_snapshot(ROOT, settings)
         seat = pick_seat(data["seats"], settings, size, set())
     except PoolSnapshotError as exc:
+        if as_json:
+            return agent_json.emit_failure("pool-unreadable", str(exc), 2)
         print(f"[codex-seat] {exc}", file=sys.stderr)
         return 2
+    if as_json:
+        answer = {"kind": kind, "size": size, "provider": "codex", "seat": seat}
+        if seat is None:
+            return agent_json.emit_failure(
+                "exhausted",
+                f"no active, idle Codex seat fits a {size} task; "
+                "see `codex-seat capacity` for Claude/local capacity",
+                3,
+                data=answer,
+            )
+        label = settings["pool"]["seats"][seat]["label"]
+        return agent_json.emit_success({**answer, "label": label})
     print(seat or "-")
     return 0 if seat else 3
+
+
+def cmd_capacity(args: argparse.Namespace, settings: dict[str, Any], warnings: list[str]) -> int:
+    """Where work can run now: every Codex seat, Claude, and local seat in one view.
+
+    Read-only and offline: it reads cached usage, the live queue and the
+    ``pick-seat`` selection, and never calls a provider. Use ``--json`` for the
+    agent envelope; ``codex-seat seats refresh --all`` updates stale usage."""
+    from . import agent_json
+    from .pool_view import collect, render_text
+
+    try:
+        view = collect(ROOT, settings, settings_warnings=warnings)
+    except PoolSnapshotError as exc:
+        if args.json:
+            return agent_json.emit_failure("pool-unreadable", str(exc), 2)
+        print(f"codex-seat capacity: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        return agent_json.emit_success(view)
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    print(render_text(view, color=color, width=_terminal_size().columns if color else 200))
+    return 0
+
+
+def cmd_help(args: argparse.Namespace) -> int:
+    from .agent_guide import AGENT_GUIDE
+
+    del args
+    print(AGENT_GUIDE, end="")
+    return 0
 
 
 def cmd_dash(args: argparse.Namespace, settings: dict[str, Any], warnings: list[str]) -> int:
@@ -164,10 +209,10 @@ def cmd_dash(args: argparse.Namespace, settings: dict[str, Any], warnings: list[
     manage_direct = bool(getattr(args, "manage", False))
     watch_requested = bool(args.watch or manage_direct)
     if manage_direct:
-        from .seat_manager import ManagerEligibilityError, ensure_management_eligible
+        from .seat_manager import ManagerEligibilityError, ensure_interactive_terminal
 
         try:
-            ensure_management_eligible()
+            ensure_interactive_terminal()
         except ManagerEligibilityError as exc:
             print(f"dash --manage refused: {exc}", file=sys.stderr)
             return 2
@@ -200,7 +245,9 @@ def cmd_dash(args: argparse.Namespace, settings: dict[str, Any], warnings: list[
         or bool(getattr(context, "managed_worker", False))
         or declared_head in {"codex", "claude"}
     )
-    captured = not output_is_tty or excluded_context
+    # A head's command pane gets the captured watch; an explicit --manage on a
+    # real terminal is a human asking for the interactive manager, even there.
+    captured = not output_is_tty or (excluded_context and not manage_direct)
     alternate_screen = not captured
     if captured:
         color = False
@@ -315,16 +362,16 @@ def _run_interactive_dash(
         ManagerEligibilityError,
         ManagerError,
         SeatManager,
-        ensure_management_eligible,
+        ensure_interactive_terminal,
     )
     from .seat_manager_tui import ManagerUI, UIExit
     from .terminal import run_ui
     from .watch import WatchRefresher
 
     try:
-        ensure_management_eligible()
+        ensure_interactive_terminal()
     except ManagerEligibilityError as exc:
-        # An ordinary watch in an excluded context is routed to captured mode
+        # An ordinary watch in a head context is routed to captured mode
         # before this point. Reaching here means both streams claim a TTY.
         print(f"interactive seat management unavailable: {exc}", file=sys.stderr)
         return 2
@@ -356,7 +403,7 @@ def _run_interactive_dash(
     manager = SeatManager(
         ROOT, settings, refresher=refresher, settings_loader=load_current
     )
-    ui = ManagerUI(manager, direct=direct)
+    ui = ManagerUI(manager, direct=direct, color=color)
     view_state = DashboardViewState()
 
     def overview(size: os.terminal_size) -> str:
@@ -437,7 +484,7 @@ def _run_interactive_dash(
                         "login confirmation snapshot is missing; select and confirm again"
                     )
                 confirmed_settings = manager.validate_login_plan(outcome.login_plan)
-                seats_cli._mutation_guard()
+                seats_cli._human_only_guard()
                 seats_cli._trusted_terminal(
                     argparse.Namespace(from_current_user_request=True), "login"
                 )
@@ -569,22 +616,22 @@ def cmd_config(args: argparse.Namespace, settings: dict[str, Any]) -> int:
             return 2
         action = getattr(args, "policy_action", None) or "show"
         if action == "show":
+            from . import agent_json
+
             if getattr(args, "policy_change", None) or getattr(args, "apply", False):
                 print("policy show takes no change or --apply", file=sys.stderr)
                 return 2
             try:
-                print(json.dumps(policy_report(settings), indent=2, sort_keys=True))
+                return agent_json.emit_success(policy_report(settings))
             except PolicyError as exc:
-                print(f"invalid policy: {exc}", file=sys.stderr)
-                return 2
-            return 0
+                return agent_json.emit_failure("invalid-policy", f"invalid policy: {exc}", 2)
         if not getattr(args, "policy_change", None):
             print("policy set requires --set KEY VALUE", file=sys.stderr)
             return 2
         if getattr(args, "apply", False):
-            from .seat_manager import ManagerEligibilityError, ensure_management_eligible
+            from .seat_manager import ManagerEligibilityError, ensure_not_managed_worker
             try:
-                ensure_management_eligible()
+                ensure_not_managed_worker()
             except ManagerEligibilityError as exc:
                 print(f"policy apply refused: {exc}", file=sys.stderr)
                 return 2
@@ -597,6 +644,8 @@ def cmd_config(args: argparse.Namespace, settings: dict[str, Any]) -> int:
             if getattr(args, "apply", False):
                 applied = apply_policy(ROOT, preview)
             print(json.dumps({
+                "schema": 1,
+                "ok": True,
                 "digest": preview.digest,
                 "before": policy_report(json.loads(preview.before)),
                 "after": policy_report(json.loads(preview.after)),
@@ -818,7 +867,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="review",
     )
     pick.add_argument("--size", choices=["small", "big"], default=None)
+    pick.add_argument(
+        "--json",
+        action="store_true",
+        help="agent envelope; exit 3 with error.code=exhausted when nothing fits",
+    )
     pick.set_defaults(handler="pick_seat")
+
+    capacity = sub.add_parser(
+        "capacity",
+        help="where work can run now across Codex, Claude and local seats (read-only)",
+        description=(
+            "Read-only view of every seat: status, 5h/7d remaining, resets, which task "
+            "sizes fit, busy work, banked resets, queued/running jobs, and the seat "
+            "pick-seat would choose next per size. Never calls a provider; refresh "
+            "stale usage with `codex-seat seats refresh --all`. Agents: use --json."
+        ),
+    )
+    capacity.add_argument("--json", action="store_true", help="agent envelope output")
+    capacity.set_defaults(handler="capacity")
+
+    help_p = sub.add_parser("help", help="print a topic guide (agents)")
+    help_p.add_argument("topic", choices=["agents"])
+    help_p.set_defaults(handler="help")
 
     dash = sub.add_parser("dash", help="human dashboard")
     dash.add_argument("--no-color", action="store_true")
@@ -846,11 +917,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="include reserve, source, last-pool-job, and raw telemetry details",
     )
     dash.set_defaults(handler="dash")
-    ui = sub.add_parser("ui", help="trusted local browser seat manager")
-    ui.add_argument("--port", type=int, default=0, help="loopback port (default: random)")
-    ui.add_argument("--no-open", action="store_true", help="print URL without opening a browser")
-    ui.add_argument("--no-active-probe", action="store_true", help="disable scheduled provider probes")
-    ui.set_defaults(handler="ui")
     status = sub.add_parser("status", help="plain or JSON pool state")
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler="status")
@@ -860,7 +926,12 @@ def build_parser() -> argparse.ArgumentParser:
     resets.add_argument("--json", action="store_true")
     resets.set_defaults(handler="resets")
     redeem = sub.add_parser("redeem-reset", help="preview or manually redeem one banked Codex reset")
-    redeem.add_argument("seat", help="registered seatN or numeric shorthand")
+    redeem.add_argument(
+        "seat", nargs="?", metavar="SEAT", help="registered seatN or numeric shorthand"
+    )
+    redeem.add_argument(
+        "--seat", dest="seat_option", metavar="SEAT", help="same as the positional SEAT"
+    )
     redeem.add_argument("--preview", action="store_true", help="read-only exact target preview")
     redeem.add_argument("--from-current-user-request", action="store_true")
     redeem.add_argument("--json", action="store_true")
@@ -878,7 +949,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     provider = sub.add_parser("provider", help="configure optional providers")
     provider_sub = provider.add_subparsers(dest="provider_command", required=True)
-    provider_sub.add_parser("status").set_defaults(handler="provider_status")
+    provider_status = provider_sub.add_parser("status")
+    provider_status.add_argument("--json", action="store_true", help="agent envelope output")
+    provider_status.set_defaults(handler="provider_status")
+    provider_claude = provider_sub.add_parser(
+        "claude", help="change Claude account settings (managed workers refused)"
+    )
+    claude_sub = provider_claude.add_subparsers(dest="claude_action", required=True)
+    claude_set = claude_sub.add_parser(
+        "set",
+        help="set Claude mode, tier label, headroom floors or active usage refresh",
+    )
+    claude_set.add_argument(
+        "--mode", choices=["off", "manual_only", "review_only", "opportunistic"]
+    )
+    claude_set.add_argument(
+        "--tier", help="subscription tier label (e.g. 'Max 20x'); 'none' clears it"
+    )
+    claude_set.add_argument("--small-headroom", type=float, metavar="PCT")
+    claude_set.add_argument("--big-headroom", type=float, metavar="PCT")
+    claude_set.add_argument("--active-usage-refresh", choices=["on", "off"])
+    claude_set.add_argument("--dry-run", action="store_true", help="preview without writing")
+    claude_set.add_argument("--json", action="store_true", help="agent envelope output")
+    claude_set.set_defaults(handler="provider_claude_set")
     provider_set = provider_sub.add_parser("set")
     provider_set.add_argument("provider_name", choices=["claude"])
     provider_set.add_argument(
@@ -1047,21 +1140,13 @@ def main(argv: list[str] | None = None) -> int:
         from .local_cli import cmd_local
 
         return cmd_local(args, ROOT)
-    if args.handler == "ui":
-        from .ui_server import launch
-        from .seat_manager import ManagerEligibilityError
-
-        try:
-            return launch(ROOT, port=args.port, no_open=args.no_open,
-                          no_active_probe=args.no_active_probe)
-        except (OSError, ValueError, ManagerEligibilityError) as exc:
-            print(f"ui refused: {exc}", file=sys.stderr)
-            return 2
+    if args.handler == "help":
+        return cmd_help(args)
     if args.handler == "dash" and bool(getattr(args, "manage", False)):
-        from .seat_manager import ManagerEligibilityError, ensure_management_eligible
+        from .seat_manager import ManagerEligibilityError, ensure_interactive_terminal
 
         try:
-            ensure_management_eligible()
+            ensure_interactive_terminal()
         except ManagerEligibilityError as exc:
             print(f"dash --manage refused: {exc}", file=sys.stderr)
             return 2
@@ -1073,6 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         handlers = {
             "pick_seat": lambda: cmd_pick_seat(args, settings),
+            "capacity": lambda: cmd_capacity(args, settings, warnings),
             "dash": lambda: cmd_dash(args, settings, warnings),
             "status": lambda: cmd_status(args, settings, warnings),
             "resets": lambda: cmd_resets(args, settings),
@@ -1082,6 +1168,7 @@ def main(argv: list[str] | None = None) -> int:
             "logins": lambda: cmd_logins(args, settings),
             "provider_status": lambda: cmd_provider_status(args, settings),
             "provider_set": lambda: cmd_provider_set(args, settings),
+            "provider_claude_set": lambda: cmd_provider_claude_set(args),
             "config": lambda: cmd_config(args, settings),
             "projects": lambda: _cmd_projects(args),
             "supervise": lambda: cmd_supervise(args, settings),
@@ -1201,31 +1288,60 @@ def _cmd_dispatch(args: argparse.Namespace, settings: dict[str, Any]) -> int:
 # ---- provider/status/reset operator commands (merged from cli_operator, v7) ----
 
 
-def cmd_provider_status(_: argparse.Namespace, settings: dict[str, Any]) -> int:
+def cmd_provider_status(args: argparse.Namespace, settings: dict[str, Any]) -> int:
     mode, reason = effective_claude_mode(settings)
     with Ledger(ROOT) as data:
         refresh_transients(data, ROOT, settings)
         provider = data["providers"]["claude"]
-        print(f"claude mode: {mode}" + (f" ({reason})" if reason else ""))
-        print(f"claude state: {provider.get('status', 'unknown')}")
-        print(f"active: {'yes' if provider.get('in_flight') else 'no'}")
-        print(f"last job: {provider.get('last_job_at') or '-'}")
-        print(f"last resolved model: {provider.get('last_resolved_model') or '-'}")
         model_states = provider.get("models", {})
-        if isinstance(model_states, dict):
-            capped = [model for model, state in model_states.items() if isinstance(state, dict) and state.get("status") == "capped"]
-            print("model caps: " + (", ".join(capped) if capped else "none"))
+        capped = (
+            [
+                model for model, state in model_states.items()
+                if isinstance(state, dict) and state.get("status") == "capped"
+            ]
+            if isinstance(model_states, dict)
+            else []
+        )
+        report: dict[str, Any] = {
+            "provider": "claude",
+            "mode": mode,
+            "mode_reason": reason,
+            "status": provider.get("status", "unknown"),
+            "busy": bool(provider.get("in_flight")),
+            "last_job_at": provider.get("last_job_at"),
+            "last_resolved_model": provider.get("last_resolved_model"),
+            "capped_models": capped,
+            "limits": None,
+        }
     limits = load_claude_rate_limits(ROOT) if mode != "off" else {}
     if limits:
-        five_hour = limits.get("five_hour", {}).get("remaining_percentage")
-        seven_day = limits.get("seven_day", {}).get("remaining_percentage")
-        marker = "" if claude_usage_fresh(settings, limits) else "~"
+        report["limits"] = {
+            "five_hour_pct": limits.get("five_hour", {}).get("remaining_percentage"),
+            "seven_day_pct": limits.get("seven_day", {}).get("remaining_percentage"),
+            "fresh": claude_usage_fresh(settings, limits),
+            "age_seconds": claude_usage_age_seconds(limits),
+        }
+    if getattr(args, "json", False):
+        from . import agent_json
+
+        return agent_json.emit_success(report)
+    print(f"claude mode: {mode}" + (f" ({reason})" if reason else ""))
+    print(f"claude state: {report['status']}")
+    print(f"active: {'yes' if report['busy'] else 'no'}")
+    print(f"last job: {report['last_job_at'] or '-'}")
+    print(f"last resolved model: {report['last_resolved_model'] or '-'}")
+    if isinstance(model_states, dict):
+        print("model caps: " + (", ".join(capped) if capped else "none"))
+    if limits:
+        five_hour = report["limits"]["five_hour_pct"]
+        seven_day = report["limits"]["seven_day_pct"]
+        marker = "" if report["limits"]["fresh"] else "~"
         print(
             "limits left: "
             f"5h={'?' if five_hour is None else f'{marker}{five_hour:.0f}%'}, "
             f"7d={'?' if seven_day is None else f'{marker}{seven_day:.0f}%'}"
         )
-        usage_age = claude_usage_age_seconds(limits)
+        usage_age = report["limits"]["age_seconds"]
         if usage_age is not None:
             print(f"usage capture age: {usage_age / 3600:.1f}h ({'fresh' if not marker else 'stale'})")
     elif mode != "off":
@@ -1241,18 +1357,11 @@ def cmd_provider_set(args: argparse.Namespace, settings: dict[str, Any]) -> int:
         print("only the managed Claude route is recognized")
         return 2
     context = current_controller()
-    if context.managed_worker:
+    if context.managed_worker or os.environ.get("CLAUDE_LEAD_WORKER") == "1":
         print("managed workers cannot change provider mode")
         return 2
-    if args.mode != "off" and (
-        (not context.is_controller and not sys.stdin.isatty())
-        or not getattr(args, "from_current_user_request", False)
-    ):
-        print(
-            "enabling managed Claude requires an interactive controller or human terminal and "
-            "--from-current-user-request for the current explicit request"
-        )
-        return 2
+    # --from-current-user-request is still accepted but no longer required:
+    # heads and plain shells may enable Claude so agents can use all capacity.
     expiry_update = None if args.expires_at == "clear" else args.expires_at
     try:
         raw_settings = (
@@ -1287,6 +1396,68 @@ def cmd_provider_set(args: argparse.Namespace, settings: dict[str, Any]) -> int:
         print(f"expiry -> {raw_settings['providers']['claude'].get('expires_at') or 'none'}")
     if claim:
         print("active Claude task " + ("termination requested" if canceled else "left to drain"))
+    return 0
+
+
+def cmd_provider_claude_set(args: argparse.Namespace) -> int:
+    """Preview and apply Claude account settings through the account manager."""
+    from . import agent_json
+    from .claude_manager import ClaudeAccountManager
+    from .seat_manager import ManagerError
+
+    changes: dict[str, Any] = {}
+    if args.mode is not None:
+        changes["mode"] = args.mode
+    if args.tier is not None:
+        changes["subscription_tier"] = None if args.tier.lower() in {"none", "clear"} else args.tier
+    if args.small_headroom is not None:
+        changes["small_task_min_headroom_pct"] = args.small_headroom
+    if args.big_headroom is not None:
+        changes["big_task_min_headroom_pct"] = args.big_headroom
+    if args.active_usage_refresh is not None:
+        changes["active_usage_refresh"] = args.active_usage_refresh == "on"
+
+    def refuse(message: str) -> int:
+        if args.json:
+            return agent_json.emit_failure("refused", message, 2)
+        print(f"provider claude set refused: {message}", file=sys.stderr)
+        return 2
+
+    if not changes:
+        return refuse(
+            "pass at least one of --mode, --tier, --small-headroom, --big-headroom, "
+            "--active-usage-refresh"
+        )
+    manager = ClaudeAccountManager(ROOT)
+    try:
+        preview = manager.preview(**changes)
+        result = None
+        if not args.dry_run:
+            # The agent's own invocation is the current request; managed
+            # workers are still refused inside commit.
+            result = manager.commit(preview, from_current_user_request=True)
+    except ManagerError as exc:
+        return refuse(str(exc))
+    finally:
+        manager.close()
+    report = {
+        "planned": bool(args.dry_run),
+        "changed": preview.changed if result is None else result.changed,
+        "before": preview.as_dict()["before"],
+        "after": preview.as_dict()["after"],
+        "warnings": list(preview.warnings if result is None else result.warnings),
+    }
+    if args.json:
+        return agent_json.emit_success(report)
+    verb = "PLAN" if args.dry_run else "APPLIED"
+    differences = [
+        f"{key}: {report['before'].get(key)} -> {report['after'].get(key)}"
+        for key in report["after"]
+        if report["before"].get(key) != report["after"].get(key)
+    ]
+    print(f"{verb} claude settings: " + ("; ".join(differences) or "no change"))
+    for warning in report["warnings"]:
+        print(f"WARNING: {warning}")
     return 0
 
 
@@ -1328,12 +1499,26 @@ def cmd_resets(args: argparse.Namespace, settings: dict[str, Any]) -> int:
         stream = sys.stderr if args.json else sys.stdout
         for message in messages:
             print(message, file=stream)
-    print(resets_status_json(ROOT, settings) if args.json else resets_report(ROOT, settings))
-    return 1 if messages and all("unavailable" in message for message in messages) else 0
+    code = 1 if messages and all("unavailable" in message for message in messages) else 0
+    if args.json:
+        from . import agent_json
+
+        data = json.loads(resets_status_json(ROOT, settings))
+        if code:
+            return agent_json.emit_failure(
+                "refresh-unavailable", "; ".join(messages), code, data=data
+            )
+        return agent_json.emit_success(data)
+    print(resets_report(ROOT, settings))
+    return code
 
 
 def cmd_redeem_reset(args: argparse.Namespace, settings: dict[str, Any]) -> int:
-    seat_id = _selected_seat(args.seat, settings)
+    alias = getattr(args, "seat_option", None)
+    if alias is not None and args.seat is not None and alias != args.seat:
+        print("SEAT and --seat disagree; pass one", file=sys.stderr)
+        return 2
+    seat_id = _selected_seat(args.seat if args.seat is not None else alias, settings)
     if seat_id is None:
         print("unknown seat; use registered seatN or numeric shorthand", file=sys.stderr)
         return 2

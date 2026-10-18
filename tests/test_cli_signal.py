@@ -332,7 +332,7 @@ class SignalTableCliTests(unittest.TestCase):
                 ui = mock.MagicMock()
                 ui.shutdown.return_value = True
                 with (
-                    mock.patch("codex_seats.seat_manager.ensure_management_eligible"),
+                    mock.patch("codex_seats.seat_manager.ensure_interactive_terminal"),
                     mock.patch("codex_seats.seat_manager.SeatManager", return_value=manager),
                     mock.patch("codex_seats.seat_manager_tui.ManagerUI", return_value=ui),
                     mock.patch(

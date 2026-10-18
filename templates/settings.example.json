@@ -31,7 +31,6 @@
       }
     },
     "primary": "seat1",
-    "deputy": "seat2",
     "reserves_pct": {"seat1": 20, "seat2": 10},
     "reserve_release_hours": 36,
     "probe_stale_seconds": 21600,
@@ -94,7 +93,6 @@
     }
   },
   "review": {"mode": "off", "strategy": "single"},
-  "ui": {"theme": "system", "density": "comfortable", "accent": "teal"},
   "providers": {
     "local": {
       "mode": "off",
