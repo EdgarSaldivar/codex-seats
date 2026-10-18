@@ -309,15 +309,17 @@ def test_fields_roles_and_lifecycle_rules(tmp_path: Path) -> None:
         successful_probe=True,
     )
 
-    set_role(tmp_path, two, "deputy")
-    with pytest.raises(SeatAdminError, match="designated deputy"):
-        drain_seat(tmp_path, two)
+    with pytest.raises(SeatAdminError, match="deputy role was removed"):
+        set_role(tmp_path, two, "deputy")
     set_role(tmp_path, two, "worker")
     set_role(tmp_path, two, "primary")
     current = json.loads((tmp_path / "settings.json").read_text())
     assert current["pool"]["primary"] == two
-    assert current["pool"]["deputy"] is None
-    with pytest.raises(SeatAdminError, match="replacement"):
+    assert "deputy" not in current["pool"]
+    # Only the primary is protected from draining.
+    with pytest.raises(SeatAdminError, match="make another seat primary first"):
+        drain_seat(tmp_path, two)
+    with pytest.raises(SeatAdminError, match="make another seat primary"):
         set_role(tmp_path, two, "worker")
 
     set_role(tmp_path, one, "primary")
@@ -539,7 +541,7 @@ def test_final_seat_allow_empty_and_idempotency(tmp_path: Path) -> None:
     assert path.stat().st_ino == inode
     current = json.loads(path.read_text())
     assert current["pool"]["primary"] is None
-    assert current["pool"]["deputy"] is None
+    assert "deputy" not in current["pool"]
     deactivate_seat(tmp_path, seat_id)
 
 

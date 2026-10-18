@@ -37,7 +37,6 @@ def pool(root: Path, *, external_primary: bool = False) -> tuple[Path, Path]:
         for seat_id, home in (("seat1", primary_home), ("seat2", secondary_home))
     }
     settings["pool"]["primary"] = "seat1"
-    settings["pool"]["deputy"] = "seat2"
     root.mkdir()
     (root / "settings.json").write_text(json.dumps(settings))
     for home in (primary_home, secondary_home):

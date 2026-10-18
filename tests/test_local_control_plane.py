@@ -650,7 +650,7 @@ def test_lifecycle_guards_and_add_commands(tmp_path, controller):
     assert loaded["local_seats"]["small"]["mode"] == "off"
 
 
-def test_remove_seat_is_manager_only_and_not_a_cli_command(tmp_path, controller, capsys):
+def test_remove_seat_is_manager_only_and_not_a_cli_command(tmp_path, controller, capsys, monkeypatch):
     settings = configured()
     settings["local_seats"]["small"] |= {"lifecycle": "inactive", "mode": "off"}
     path = tmp_path / "settings.json"
@@ -668,7 +668,8 @@ def test_remove_seat_is_manager_only_and_not_a_cli_command(tmp_path, controller,
     with pytest.raises(ValueError, match="only through the interactive seat manager"):
         local_cli.apply_action(tmp_path, "remove-seat", "small", expected_digest=preview["before_digest"],
                                from_current_user_request=True)
-    # Nor can the manager authority from a controller context.
+    # Nor can the manager authority from a managed worker.
+    monkeypatch.setenv("CODEX_SEATS_MANAGED_WORKER", "1")
     with pytest.raises(ValueError, match="refused"):
         local_cli.apply_action(tmp_path, "remove-seat", "small", expected_digest=preview["before_digest"],
                                from_current_user_request=True, authority=local_cli.MANAGER_AUTHORITY)
@@ -679,7 +680,7 @@ def test_management_preserves_unknown_keys(tmp_path, controller):
     raw = {
         "schema": 3,
         "unrecognized": {"preserve": True},
-        "pool": {"seats": {}, "primary": None, "deputy": None},
+        "pool": {"seats": {}, "primary": None},
     }
     (tmp_path / "settings.json").write_text(json.dumps(raw))
     local_cli.mutate(tmp_path, args("set-global-mode", "off"))
@@ -864,7 +865,7 @@ def test_edit_label_on_enabled_seat_is_not_activation(tmp_path, controller):
     assert local_cli._mode_rank("unlimited") > local_cli._mode_rank("opportunistic")
 
 
-def test_manager_authority_requires_eligible_human_tty(tmp_path, human_terminal, monkeypatch):
+def test_manager_authority_refuses_only_managed_workers(tmp_path, human_terminal, monkeypatch):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps(configured()))
     original = path.read_bytes()
@@ -877,20 +878,14 @@ def test_manager_authority_requires_eligible_human_tty(tmp_path, human_terminal,
         options.update(overrides)
         return local_cli.apply_action(tmp_path, "edit-host", "studio", changes=changes, **options)
 
-    # Controller/head and managed-worker contexts are refused even though both
-    # streams claim to be a (pseudo) terminal.
-    for env in ({"CODEX_CONTROL_SEAT": "seat1"}, {"CODEX_SEATS_HEAD": "claude"},
-                {"CODEX_SEATS_HEAD": "codex"}, {"CODEX_THREAD_ID": "t1", "CODEX_HOME": "/tmp/x"},
-                {"CODEX_SEATS_MANAGED_WORKER": "1"}):
+    # Managed workers are refused even though both streams claim to be a
+    # (pseudo) terminal; heads and controllers may write through the manager.
+    for env in ({"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}):
         with monkeypatch.context() as patch:
             for name, value in env.items():
                 patch.setenv(name, value)
-            with pytest.raises(ValueError, match="refused: controller/head|managed workers"):
+            with pytest.raises(ValueError, match="managed workers"):
                 apply()
-    with monkeypatch.context() as patch:
-        patch.setattr(local_cli.sys.stdout, "isatty", lambda: False)
-        with pytest.raises(ValueError, match="refused: .*terminal"):
-            apply()
     with pytest.raises(ValueError, match="explicit confirmation of the current request"):
         apply(from_current_user_request=False)
     with pytest.raises(ValueError, match="previewed settings digest"):

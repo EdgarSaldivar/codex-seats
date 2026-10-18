@@ -14,6 +14,8 @@ from typing import Any, Callable, Protocol
 
 ALT_ON = "\033[?1049h"
 ALT_OFF = "\033[?1049l"
+# Shift-Tab arrives as CSI Z; the raw sequence is the key's stable name.
+KEY_BACKTAB = "\x1b[Z"
 
 
 def paint_frame(frame: str, height: int) -> str:
@@ -94,6 +96,8 @@ def decode_key(payload: bytes) -> str:
     }
     if payload in arrows:
         return arrows[payload]
+    if payload == b"\x1b[Z":
+        return KEY_BACKTAB
     if payload == b"\x1b":
         return "esc"
     if payload in {b"\r", b"\n"}:
@@ -149,7 +153,9 @@ class TerminalSession:
     def _take_key(self) -> str | None:
         if not self._input:
             return None
-        sequences = (b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b[5~", b"\x1b[6~")
+        sequences = (
+            b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b[5~", b"\x1b[6~", b"\x1b[Z"
+        )
         for sequence in sequences:
             if self._input.startswith(sequence):
                 self._input = self._input[len(sequence):]

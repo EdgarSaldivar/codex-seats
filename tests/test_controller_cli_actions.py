@@ -18,7 +18,7 @@ def _clear_controller_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_remote_controller_can_enable_provider_only_with_request_flag(
+def test_remote_controller_can_enable_provider_with_or_without_request_flag(
     tmp_path, monkeypatch
 ):
     _clear_controller_env(monkeypatch)
@@ -34,7 +34,7 @@ def test_remote_controller_can_enable_provider_only_with_request_flag(
         reset_state=False,
         cancel_active=False,
     )
-    assert cli.cmd_provider_set(args, default_settings()) == 2
+    assert cli.cmd_provider_set(args, default_settings()) == 0
     args.from_current_user_request = True
     assert cli.cmd_provider_set(args, default_settings()) == 0
 
@@ -55,7 +55,7 @@ def test_claude_head_can_enable_provider_without_a_tty(tmp_path, monkeypatch):
     assert cli.cmd_provider_set(args, default_settings()) == 0
 
 
-def test_arbitrary_noninteractive_shell_cannot_enable_provider(
+def test_noninteractive_shell_can_enable_provider_but_managed_worker_cannot(
     tmp_path, monkeypatch
 ):
     _clear_controller_env(monkeypatch)
@@ -64,9 +64,12 @@ def test_arbitrary_noninteractive_shell_cannot_enable_provider(
     provider_args = SimpleNamespace(
         provider_name="claude",
         mode="manual_only",
-        from_current_user_request=True,
+        from_current_user_request=False,
         expires_at=None,
         reset_state=False,
         cancel_active=False,
     )
+    assert cli.cmd_provider_set(provider_args, default_settings()) == 0
+    monkeypatch.setenv("CODEX_SEATS_MANAGED_WORKER", "1")
+    provider_args.mode = "off"
     assert cli.cmd_provider_set(provider_args, default_settings()) == 2

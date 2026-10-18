@@ -163,7 +163,7 @@ def test_sanitized_two_seat_target_fixture_is_enforced_golden(tmp_path):
     assert settings["schema"] == 3
     assert list(seats) == ["seat1", "seat2"]
     assert settings["pool"]["primary"] == "seat1"
-    assert settings["pool"]["deputy"] == "seat2"
+    assert "deputy" not in settings["pool"]
     assert [seats[seat_id]["relative_capacity"] for seat_id in seats] == [5.0, 1.0]
     observed = time.time()
     for seat_id in seats:

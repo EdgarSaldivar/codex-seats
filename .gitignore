@@ -39,10 +39,6 @@
 !lib/
 !lib/codex_seats/
 !lib/codex_seats/*.py
-!lib/codex_seats/ui/
-!lib/codex_seats/ui/*.html
-!lib/codex_seats/ui/*.css
-!lib/codex_seats/ui/*.js
 
 # Tests and deterministic fixtures.
 !tests/

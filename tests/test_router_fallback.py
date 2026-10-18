@@ -59,7 +59,6 @@ def _schema3_settings(*, claude_mode: str = "off") -> dict:
         },
     }
     settings["pool"]["primary"] = "seat1"
-    settings["pool"]["deputy"] = "seat2"
     settings["providers"]["claude"]["mode"] = claude_mode
     return settings
 
@@ -361,7 +360,8 @@ class InteractiveHeadAuthoringRouteTests(unittest.TestCase):
         self.assertEqual(result.worker, "seat3")
         self.assertEqual(codex.call_count, 2)
         first, second = [call.args[2] for call in codex.call_args_list]
-        self.assertEqual(first["_excluded_seats"], ["seat3"])
+        # Phase 1 spends 1x workers only: the 5x seat and the primary wait.
+        self.assertEqual(first["_excluded_seats"], ["seat1", "seat3"])
         self.assertEqual(second["route_reason"], "router:phase2-opposite-head-family")
         self.assertEqual(second["model"], "gpt-6-astra")
         self.assertFalse(claude.called)

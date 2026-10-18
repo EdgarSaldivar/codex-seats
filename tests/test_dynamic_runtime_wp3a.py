@@ -52,7 +52,6 @@ def _settings(
         seat_id for seat_id, lifecycle in lifecycles.items() if lifecycle == "active"
     ]
     settings["pool"]["primary"] = active[0] if active else None
-    settings["pool"]["deputy"] = active[1] if len(active) > 1 else None
     return settings
 
 
@@ -307,7 +306,6 @@ def test_codex_claim_barrier_reloads_lifecycle_before_publication(
         _healthy(data["seats"]["seat6"])
     current = copy.deepcopy(supplied)
     current["pool"]["seats"]["seat6"]["lifecycle"] = new_lifecycle
-    current["pool"]["deputy"] = None
 
     def barrier(phase: str) -> None:
         if phase == "after_provider_ledger_lock_before_settings_reload":
@@ -340,7 +338,6 @@ def test_automatic_codex_claim_barrier_excludes_newly_draining_seat(
         _healthy(data["seats"]["seat6"])
     current = copy.deepcopy(supplied)
     current["pool"]["seats"]["seat6"]["lifecycle"] = "draining"
-    current["pool"]["deputy"] = None
 
     def barrier(phase: str) -> None:
         if phase == "after_provider_ledger_lock_before_settings_reload":

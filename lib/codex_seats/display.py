@@ -6,19 +6,18 @@ import os
 import re
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import dispatch_client, local_seats
+from . import dispatch_client, local_seats, pool_view
 from .capacity import seat_capacity_report
 from .claude_manager import resolve_subscription_tier
 from .dispatch_protocol import DispatchError
 from .provider_claude import claude_capacity_report
 from .operator_reporting import schema3_operator_report
-from .seat_registry import CAPACITY_PLAN_PRESETS, derive_roles, registered_seat_ids
+from .seat_registry import derive_roles, registered_seat_ids
 from .state import (
     Ledger,
     age_h,
@@ -33,41 +32,35 @@ from .state import (
     usable_headroom,
 )
 from .telemetry import refresh_passive_usage
+from .tui_style import (
+    ANSI,
+    TMUX,
+    Chip,
+    age as _age,
+    clip,
+    clock,
+    countdown,
+    display_width,
+    duration,
+    human,
+    one_line,
+    paint,
+    render_parts,
+    status_chip,
+    usage_bar,
+    window_label,
+)
 
-
-ANSI = {
-    "green": "\033[38;2;80;250;123m",
-    "cyan": "\033[38;2;139;233;253m",
-    "amber": "\033[38;2;241;250;140m",
-    "red": "\033[38;2;255;85;85m",
-    "gray": "\033[38;2;98;114;164m",
-    "purple": "\033[38;2;189;147;249m",
-    "dim": "\033[2m",
-    "reset": "\033[0m",
-}
-
-TMUX = {
-    "green": "#50fa7b",
-    "cyan": "#8be9fd",
-    "amber": "#f1fa8c",
-    "red": "#ff5555",
-    "gray": "#6272a4",
-    "purple": "#bd93f9",
-}
-
-_CODEX_PLAN_NAMES = {
-    preset["profile"]: preset["label"].split(" (", 1)[0]
-    for preset in CAPACITY_PLAN_PRESETS
-}
+__all__ = ["ANSI", "TMUX", "DashboardViewState", "dashboard", "segment"]
 
 
 def _codex_plan_name(settings: dict[str, Any], seat_id: str) -> str:
     """Display the configured plan profile, never infer it from a multiplier."""
     entry = settings.get("pool", {}).get("seats", {}).get(seat_id, {})
     profile = entry.get("capacity_profile") if isinstance(entry, dict) else None
-    if not isinstance(profile, str) or not profile or profile == "unverified":
+    if not isinstance(profile, str) or not profile:
         return "Unverified"
-    return _CODEX_PLAN_NAMES.get(profile, f"profile: {profile}")
+    return human("capacity_profile", profile)
 
 
 def _view_seat_ids(settings: dict[str, Any]) -> list[str]:
@@ -90,20 +83,7 @@ def fmt_tokens(value: float | int) -> str:
 
 
 def _countdown(reset_at: Any, *, compact: bool = True, at: float | None = None) -> str:
-    if not isinstance(reset_at, (int, float)):
-        return "?"
-    current = datetime.now(timezone.utc).timestamp() if at is None else at
-    seconds = max(0, int(float(reset_at) - current))
-    if seconds <= 0:
-        return "now"
-    minutes = max(1, (seconds + 59) // 60)
-    if minutes < 60:
-        return f"{minutes}m"
-    hours, remaining_minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h" if compact or remaining_minutes == 0 else f"{hours}h{remaining_minutes:02d}m"
-    days, remaining_hours = divmod(hours, 24)
-    return f"{days}d" if compact or remaining_hours == 0 else f"{days}d{remaining_hours:02d}h"
+    return countdown(reset_at, at, compact=compact)
 
 
 def _window_label(name: str) -> str:
@@ -134,7 +114,8 @@ def _next_reset_badge(limits: dict[str, Any]) -> str:
 def role_badges(settings: dict[str, Any]) -> dict[str, str]:
     """Compact role badge per visible seat; seats are always selected by seatN."""
     roles = derive_roles(settings)
-    badges = {"primary": "P", "deputy": "D", "worker": "W"}
+    # Roles are primary and worker; a legacy "deputy" renders as a worker.
+    badges = {"primary": "P", "worker": "W", "deputy": "W"}
     return {
         seat_id: badges.get(roles.get(seat_id, ""), "-")
         for seat_id in _view_seat_ids(settings)
@@ -327,16 +308,7 @@ def _observed_reset_summary(seat: dict[str, Any], *, at: float) -> str:
 
 
 def _usage_age_text(seconds: float | None) -> str:
-    if seconds is None:
-        return "never"
-    seconds = max(0.0, seconds)
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    if seconds < 86400:
-        return f"{seconds / 3600:.1f}h"
-    return f"{seconds / 86400:.1f}d"
+    return _age(seconds)
 
 
 @dataclass
@@ -407,61 +379,82 @@ def _snapshot_value(snapshot: Any, name: str, default: Any = None) -> Any:
 
 
 def _terminal_text(text: Any) -> str:
-    characters: list[str] = []
-    for character in str(text):
-        if character in "\r\n\t":
-            characters.append(" ")
-        elif not unicodedata.category(character).startswith("C"):
-            characters.append(character)
-    return "".join(characters)
+    return one_line(text)
 
 
 def _display_width(text: str) -> int:
-    return sum(
-        0
-        if unicodedata.combining(character)
-        else 2
-        if unicodedata.east_asian_width(character) in {"W", "F"}
-        else 1
-        for character in text
-    )
+    return display_width(text)
 
 
 def _plain_clip(text: Any, width: int) -> str:
-    value = _terminal_text(text)
-    if width <= 0:
-        return ""
-    if _display_width(value) <= width:
-        return value
-    if width == 1:
-        return "…"
-    kept: list[str] = []
-    used = 0
-    for character in value:
-        cell_width = _display_width(character)
-        if used + cell_width > width - 1:
-            break
-        kept.append(character)
-        used += cell_width
-    return "".join(kept) + "…"
+    return clip(text, width)
 
 
 def _paint(text: str, name: str | None, color: bool) -> str:
-    if not color or not name or not text:
-        return text
-    return f"{ANSI[name]}{text}{ANSI['reset']}"
+    return paint(text, name, color)
 
 
 def _line(parts: list[tuple[str, str | None]], width: int, color: bool) -> str:
-    remaining = max(1, width)
-    rendered: list[str] = []
-    for raw, name in parts:
-        if remaining <= 0:
-            break
-        text = _plain_clip(raw, remaining)
-        rendered.append(_paint(text, name, color))
-        remaining -= _display_width(text)
-    return "".join(rendered).rstrip()
+    return render_parts(parts, width, color)
+
+
+def live_header(
+    refresh_snapshot: Any, *, current: float, monotonic_at: float | None = None
+) -> tuple[list[tuple[str, str | None]], str]:
+    """``codex-seats ● LIVE 14:32`` parts and the refresh freshness text.
+
+    Shared by the dashboard and the seat manager's summary strip so both say
+    LIVE / REFRESHING / CACHED and "updated 12s ago" the same way.
+    """
+    current_monotonic = time.monotonic() if monotonic_at is None else float(monotonic_at)
+    refreshing = bool(_snapshot_value(refresh_snapshot, "refreshing", False))
+    if refreshing:
+        live_text, live_color = "↻ REFRESHING", "live"
+    elif refresh_snapshot is not None:
+        live_text, live_color = "● LIVE", "live"
+    else:
+        live_text, live_color = "○ CACHED", "muted"
+    succeeded = _snapshot_value(refresh_snapshot, "last_succeeded", "unset")
+    success_at = _snapshot_value(refresh_snapshot, "last_success_at")
+    if not isinstance(success_at, (int, float)):
+        result = _snapshot_value(refresh_snapshot, "last_result")
+        recent_ok = succeeded is True if succeeded != "unset" else _refresh_succeeded(result)
+        if recent_ok:
+            success_at = _snapshot_value(refresh_snapshot, "last_finished_at")
+    last_ok = "—" if not isinstance(success_at, (int, float)) else _usage_age_text(current - float(success_at))
+    next_due = _snapshot_value(refresh_snapshot, "next_due")
+    if refreshing:
+        next_text = "after refresh"
+    elif isinstance(next_due, (int, float)):
+        next_text = _countdown(current + max(0.0, float(next_due) - current_monotonic), at=current)
+    else:
+        next_text = "pending"
+    local_time = datetime.fromtimestamp(current).astimezone().strftime("%H:%M")
+    live_parts: list[tuple[str, str | None]] = [
+        ("codex-seats", "heading"),
+        ("  ", None),
+        (live_text, live_color),
+        (f" {local_time}", "muted"),
+    ]
+    updated = "not refreshed yet" if last_ok == "—" else f"updated {last_ok} ago"
+    return live_parts, updated if next_text == "pending" else f"{updated} · next {next_text}"
+
+
+def header_parts(
+    live_parts: list[tuple[str, str | None]],
+    summary_parts: list[tuple[str, str | None]],
+    freshness_text: str,
+    width: int,
+) -> list[list[tuple[str, str | None]]]:
+    """One header line when it fits, else live+freshness over the summary."""
+    left_width = sum(display_width(text) for text, _ in live_parts)
+    summary_width = sum(display_width(text) for text, _ in summary_parts)
+    if left_width + 3 + summary_width + 2 + display_width(freshness_text) <= width:
+        gap = width - left_width - 3 - summary_width - display_width(freshness_text)
+        return [
+            [*live_parts, ("   ", None), *summary_parts, (" " * gap, None), (freshness_text, "muted")]
+        ]
+    return [[*live_parts, (" · ", "muted"), (freshness_text, "muted")], summary_parts]
 
 
 def _cell(
@@ -505,33 +498,283 @@ def _delta_text(delta: float | None) -> str:
     return f"{symbol}{abs(delta):g}"
 
 
-def _capacity_parts(
+def _window_cell(
     value: float | None,
     delta: float | None,
-    health: str,
-    width: int,
+    *,
+    fresh: bool,
+    bar: int,
+    delta_width: int,
 ) -> list[tuple[str, str | None]]:
-    if value is None:
-        filled = 0
-        percent = " ?%"
-    else:
-        filled = min(10, max(0, int(value / 10 + 0.5)))
-        percent = f" {value:g}%"
-    delta_value = _delta_text(delta)
-    suffix = percent + (f" {delta_value}" if delta_value else "")
-    used = min(10, width)
-    parts: list[tuple[str, str | None]] = []
-    if used:
-        parts.append(("█" * min(filled, used), health))
-        parts.append(("░" * max(0, used - filled), "dim"))
-    remaining = max(0, width - used)
-    suffix = _plain_clip(suffix, remaining)
-    if suffix:
-        parts.append((suffix, health if value is not None else "amber"))
-    visible = used + _display_width(suffix)
-    if visible < width:
-        parts.append((" " * (width - visible), None))
+    """One usage window: threshold-coloured bar, ``NN%`` and a refresh delta."""
+    parts = usage_bar(value, bar, fresh=fresh)
+    if delta_width:
+        text = clip(f" {_delta_text(delta)}" if _delta_text(delta) else "", delta_width)
+        parts.append((text, "muted"))
+        parts.append((" " * (delta_width - display_width(text)), None))
     return parts
+
+
+def _capacity_window_values(
+    capacity: dict[str, Any],
+) -> dict[str, tuple[float | None, float | None]]:
+    """Short window label (``5h``/``7d``) → (remaining %, reset) for one seat."""
+    values: dict[str, tuple[float | None, float | None]] = {}
+    for window in capacity.get("capacity_windows") or []:
+        if not isinstance(window, dict):
+            continue
+        short = window_label(window.get("name"), window.get("window_minutes"), short=True)
+        remaining = window.get("remaining_pct")
+        reset = window.get("resets_at")
+        values.setdefault(
+            short,
+            (
+                float(remaining) if isinstance(remaining, (int, float)) else None,
+                float(reset) if isinstance(reset, (int, float)) else None,
+            ),
+        )
+    return values
+
+
+def _exhausted_window(windows: dict[str, tuple[float | None, float | None]]) -> str | None:
+    for short, (remaining, _reset) in sorted(windows.items()):
+        if remaining is not None and remaining <= 0:
+            return short
+    return None
+
+
+def _table_layout(width: int) -> dict[str, int] | None:
+    """Column widths for the seat table, or ``None`` for the stacked layout.
+
+    Bars, the delta field and the FIT wording shrink first; the seat and
+    status columns share whatever remains, and the sum never exceeds ``width``.
+    """
+    for bar, delta, fit in ((10, 4, 9), (8, 4, 9), (8, 4, 4), (6, 4, 4), (5, 0, 4), (4, 0, 4)):
+        window = bar + 5 + delta
+        gap = 1 if delta else 2
+        fixed = 2 + 2 + window + gap + window + gap + 6 + 2 + 2 + fit + 1 + 6
+        spare = width - fixed
+        if spare >= 30:
+            # Names get the room first; status keeps at least 15 cells.
+            seat = min(28, max(16, spare - 15, spare // 2))
+            return {
+                "seat": seat,
+                "bar": bar,
+                "delta": delta,
+                "window": window,
+                "gap": gap,
+                "status": min(28, spare - seat),
+                "fit": fit,
+            }
+    return None
+
+
+def _table_header(layout: dict[str, int]) -> list[tuple[str, str | None]]:
+    gap = (" " * layout["gap"], None)
+    return [
+        ("  ", None),
+        *_cell("SEAT", layout["seat"], style="muted"),
+        ("  ", None),
+        *_cell("5H LEFT", layout["window"], style="muted"),
+        gap,
+        *_cell("7D LEFT", layout["window"], style="muted"),
+        gap,
+        *_cell("RESET", 6, style="muted"),
+        ("  ", None),
+        *_cell("STATUS", layout["status"], style="muted"),
+        ("  ", None),
+        *_cell("FIT", layout["fit"], style="muted"),
+        (" ", None),
+        *_cell("AGE", 6, align="right", style="muted"),
+    ]
+
+
+def _name_cell(name: str, plan: str, width: int) -> list[tuple[str, str | None]]:
+    """Seat name with its plan in muted text, padded to ``width`` cells."""
+    name_text = clip(name, width)
+    used = display_width(name_text)
+    plan_text = clip(f" {plan}", width - used) if plan and width - used > 2 else ""
+    used += display_width(plan_text)
+    return [(name_text, None), (plan_text, "muted"), (" " * max(0, width - used), None)]
+
+
+def _local_name(row: dict[str, Any]) -> str:
+    return f"{row['model']} on {row['host']}"
+
+
+def _local_table_row(row: dict[str, Any], name: str) -> dict[str, Any]:
+    """Adapt one shared local status row to the seat table (no usage windows)."""
+    working = row["key"] == "working"
+    return {
+        "kind": "local",
+        "role": "L",
+        "account": row["name"],
+        "name": name,
+        "plan": "",
+        "windows": {},
+        "fresh": True,
+        "reset": None,
+        "chip": status_chip(
+            "local",
+            row["key"],
+            task=row["detail"] if working else None,
+            age=row["age_text"] if row["stale"] and row["age_text"] != "—" else None,
+        ),
+        "fit": "—",
+        "age": row["age_text"],
+        "stale": row["stale"],
+    }
+
+
+def _local_attention(local_rows: list[dict[str, Any]]) -> list["_AttentionItem"]:
+    """Local seats that need an operator: stale probes, failures, wrong models."""
+    items: list[_AttentionItem] = []
+    for row in local_rows:
+        name = _local_name(row)
+        detail = str(row.get("detail") or "")
+        if detail and detail == row.get("reason"):
+            detail = human("reason", detail)
+        diagnostic = (
+            f"local {row['name']} {row['key']}: {detail or '-'}; reason={row['reason'] or '-'}"
+        )
+        if row["key"] == "stale":
+            items.append(
+                _AttentionItem(
+                    "amber",
+                    name,
+                    f"Local seat {name} has not been probed for {row['age_text']}",
+                    "probe its host from `codex-seat dash --manage`",
+                    diagnostic,
+                )
+            )
+        elif row["key"] == "degraded":
+            items.append(
+                _AttentionItem(
+                    "red",
+                    name,
+                    f"Local seat {name} is degraded"
+                    + (f": {detail[:1].lower()}{detail[1:]}" if detail else ""),
+                    "check the host, then probe it again",
+                    diagnostic,
+                )
+            )
+        elif row["key"] == "model_mismatch":
+            items.append(
+                _AttentionItem(
+                    "red",
+                    name,
+                    f"Local seat {name} is {detail or 'serving another model'}",
+                    "load the configured model or update the seat",
+                    diagnostic,
+                )
+            )
+    return items
+
+
+def _seat_row_lines(
+    row: dict[str, Any],
+    layout: dict[str, int] | None,
+    deltas: dict[str, float],
+    *,
+    width: int,
+    at: float,
+) -> list[list[tuple[str, str | None]]]:
+    """One table line per seat, or two stacked lines when the table cannot fit."""
+    chip: Chip = row["chip"]
+    reset_text = "—" if row.get("reset") is None else countdown(row["reset"], at)
+    reset_role = "warn" if row.get("missing") else "muted"
+    fit = str(row.get("fit") or "—")
+    fit_role = "muted" if fit in {"—", "none"} else None
+    age_text = ("~" if row["stale"] and row["age"] != "—" else "") + row["age"]
+    age_role = "warn" if row["stale"] else "muted"
+    if layout is not None:
+        gap = (" " * layout["gap"], None)
+        parts: list[tuple[str, str | None]] = [(row["role"], None), (" ", None)]
+        parts += _name_cell(row["name"], row.get("plan") or "", layout["seat"])
+        parts.append(("  ", None))
+        for index, short in enumerate(("5h", "7d")):
+            if index:
+                parts.append(gap)
+            remaining, _reset = row["windows"].get(short, (None, None))
+            parts += _window_cell(
+                remaining,
+                deltas.get(f"{row['account']}:{short}"),
+                fresh=row["fresh"],
+                bar=layout["bar"],
+                delta_width=layout["delta"],
+            )
+        parts.append(gap)
+        parts += _cell(reset_text, 6, style=reset_role)
+        parts.append(("  ", None))
+        parts += _cell(chip.text, layout["status"], style=chip.role)
+        parts.append(("  ", None))
+        parts += _cell(_fit_text(fit, expanded=layout["fit"] > 4), layout["fit"], style=fit_role)
+        parts.append((" ", None))
+        parts += _cell(age_text, 6, align="right", style=age_role)
+        return [parts]
+    if width < 60:
+        # One line per seat: the tightest window, then the status chip.
+        known = [
+            (remaining, short)
+            for short, (remaining, _reset) in sorted(row.get("windows", {}).items())
+            if remaining is not None
+        ]
+        line: list[tuple[str, str | None]] = [
+            (row["role"], None),
+            (" ", None),
+            *_name_cell(row["name"], row.get("plan") or "", max(12, min(22, width - 30))),
+            (" ", None),
+        ]
+        if row["kind"] == "local":
+            line += [(chip.text, chip.role), ("  ", None), (age_text, age_role)]
+            return [line]
+        remaining, short = min(known) if known else (None, "  ")
+        line += [
+            (f"{short} ", "muted"),
+            *usage_bar(remaining, 5, fresh=row["fresh"]),
+            ("  ", None),
+            (chip.text, chip.role),
+        ]
+        return [line]
+    name_width = max(10, min(26, width - 20))
+    first: list[tuple[str, str | None]] = [
+        (row["role"], None),
+        (" ", None),
+        *_name_cell(row["name"], row.get("plan") or "", name_width),
+        ("  ", None),
+        (chip.text, chip.role),
+    ]
+    if row["kind"] == "local":
+        # A stale chip already carries the probe age.
+        return [first if row["stale"] else [*first, ("  ", None), (age_text, age_role)]]
+    second: list[tuple[str, str | None]] = [("    ", None)]
+    for short in ("5h", "7d"):
+        remaining, _reset = row["windows"].get(short, (None, None))
+        second += [(f"{short} ", "muted"), *usage_bar(remaining, 5, fresh=row["fresh"]), ("  ", None)]
+    second += [
+        (f"{reset_text:<5}", reset_role),
+        ("  ", None),
+        (f"{_fit_text(fit, expanded=False):<4}", fit_role),
+        ("  ", None),
+        (age_text, age_role),
+    ]
+    return [first, second]
+
+
+def _rule(
+    title: str, right: str, width: int, color: bool, *, role: str = "heading"
+) -> str:
+    """Section heading drawn as ``── TITLE ─────── right ──``."""
+    head = f"── {title} "
+    tail = f" {right} ──" if right else "──"
+    fill = width - display_width(head) - display_width(tail)
+    if fill < 2:
+        return _line([(title, role), (f" {right}" if right else "", "muted")], width, color)
+    return _line(
+        [("── ", "muted"), (title, role), (" " + "─" * fill, "muted"), (tail, "muted")],
+        width,
+        color,
+    )
 
 
 def _refresh_failed(result: Any) -> bool:
@@ -551,23 +794,6 @@ def _refresh_succeeded(result: Any) -> bool:
     return bool(match and match.group(1) == match.group(2))
 
 
-def _provider_state(
-    status: Any, claim: Any, *, disabled: bool = False, unhealthy: bool = False
-) -> tuple[str, str]:
-    if disabled:
-        return "· disabled", "dim"
-    if isinstance(claim, dict):
-        return f"● {claim.get('kind') or 'working'}", "cyan"
-    if unhealthy:
-        return "× error", "red"
-    normalized = str(status or "unknown").lower()
-    if normalized == "ok":
-        return "○ idle", "green"
-    if normalized in {"capped", "cooldown"}:
-        return "◐ capped", "red" if normalized == "capped" else "amber"
-    return "× error", "red"
-
-
 def _fit_label(report: dict[str, Any]) -> str:
     """Compact routing fit label, independent of provider activity."""
     if not report.get("applicable", report.get("auth_ok", False)):
@@ -582,15 +808,7 @@ def _fit_label(report: dict[str, Any]) -> str:
 
 
 def _fit_text(label: str, *, expanded: bool) -> str:
-    if not expanded:
-        return label
-    return {
-        "S+B": "small + big",
-        "S": "small only",
-        "B": "big only",
-        "none": "no fit",
-        "—": "not available",
-    }.get(label, label)
+    return human("fit", label) if expanded else label
 
 
 def _binding_window(
@@ -630,37 +848,12 @@ def _claude_binding_window(
     return min(candidates, key=lambda item: (item[1], item[0])) if candidates else (None, None, None)
 
 
-def _limit_reset_text(name: str | None, reset_at: float | None, *, at: float) -> str:
-    if name is None:
-        return "not reported"
-    reset = "unknown" if reset_at is None else _countdown(reset_at, compact=False, at=at)
-    label = {
-        "5h": "5-hour",
-        "five_hour": "5-hour",
-        "weekly": "weekly",
-        "seven_day": "7-day",
-        "monthly": "monthly",
-    }.get(name, name)
-    return f"{label} · reset {reset}"
-
-
 def _claim_request_id(claim: dict[str, Any]) -> str | None:
     for key in ("request_id", "label"):
         value = claim.get(key)
         if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value):
             return value
     return None
-
-
-def _work_state(state: Any) -> tuple[str, str]:
-    normalized = str(state or "running").lower()
-    return {
-        "running": ("Running", "cyan"),
-        "queued": ("Queued", "amber"),
-        "waiting_capacity": ("Waiting for capacity", "amber"),
-        "recovering": ("Recovering", "red"),
-        "expired": ("Expired", "red"),
-    }.get(normalized, (str(state or "Running").replace("_", " ").title(), "amber"))
 
 
 def _group_attention(
@@ -690,14 +883,17 @@ def _group_attention(
         if item.owner not in owners:
             owners.append(item.owner)
     problem_count = len(priority) + len(owners)
+    def joined(text: str, action: str) -> str:
+        return f"{text} · {action}" if action else text
+
     if forensic:
         return [
-            (item.style, f"{item.owner}: {item.diagnostic} · Next: {item.action}")
+            (item.style, f"{item.owner}: {item.diagnostic}" + (f" · Next: {item.action}" if item.action else ""))
             for item in ordered
         ], problem_count
 
     grouped: list[tuple[str, str]] = [
-        (item.style, f"{item.diagnostic} · Next: {item.action}") for item in priority
+        (item.style, joined(item.diagnostic, item.action)) for item in priority
     ]
     for owner in owners:
         owned = [item for item in ordered if item.owner == owner]
@@ -711,9 +907,7 @@ def _group_attention(
         )
         extra = len(owned) - 1
         suffix = f" · {extra} more (--forensic)" if extra else ""
-        grouped.append(
-            (main.style, f"{owner}: {main.problem} · Next: {main.action}{suffix}")
-        )
+        grouped.append((main.style, joined(main.problem, main.action) + suffix))
     return grouped, problem_count
 
 
@@ -801,6 +995,17 @@ def _bound_dashboard_lines(
     return kept
 
 
+def _provider_problem(status: Any) -> str:
+    """Plain wording for a non-ok provider status, after ``<owner> provider``."""
+    chip = status_chip("codex", status)
+    return {
+        "needs sign-in": "needs a new sign-in",
+        "capped": "is capped",
+        "cooldown": "is cooling down",
+        "not probed": "has not been probed yet",
+    }.get(chip.label, f"reports {one_line(status or 'unknown')}")
+
+
 def _status_is_error(status: Any) -> bool:
     return str(status or "unknown").lower() not in {"ok", "off"}
 
@@ -840,13 +1045,19 @@ def _terminal_history(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return groups
 
 
+def _history_label(label: Any) -> str:
+    """Request-id labels shrink to ``job abcd1234`` as in ONGOING WORK."""
+    text = str(label or "-")
+    return f"job {text[:8]}" if re.fullmatch(r"[0-9a-f]{32}", text) else text
+
+
 def _history_status(status: str) -> tuple[str, str]:
     lowered = status.lower()
     if lowered in {"completed", "succeeded", "success", "ok"}:
-        return f"✓ {status}", "green"
+        return "✓", "ok"
     if "block" in lowered or lowered in {"canceled", "cancelled"}:
-        return f"! {status}", "amber"
-    return f"× {status}", "red"
+        return f"! {status}", "warn"
+    return f"× {status}", "bad"
 
 
 _LOCAL_STATE_STYLES: dict[str, tuple[str, str]] = {
@@ -1129,7 +1340,8 @@ def _settings_warning_lines(warnings: list[str], *, forensic: bool) -> list[str]
             other.append(message)
     if unknown:
         other.append(
-            f"settings unknown keys: {unknown} preserved; run dash --forensic for details"
+            f"Settings file has {unknown} unrecognised key{'s' if unknown != 1 else ''} (kept)"
+            " · run dash --forensic to see them"
         )
     return other
 
@@ -1179,9 +1391,9 @@ def dashboard(
             _AttentionItem(
                 "red",
                 "Security",
-                "background work is unavailable",
-                "check owner-only dispatch queue permissions",
-                "background work unavailable; queue security validation failed",
+                "Background work is unavailable",
+                "check the dispatch queue's owner-only permissions",
+                "Background work is unavailable: the dispatch queue failed its security check",
                 priority=True,
             )
         )
@@ -1216,29 +1428,14 @@ def dashboard(
                 learning=snapshot.get("capacity_learning", {}),
             )
         )
-        binding_name, value, binding_reset = _binding_window(capacity)
-        balances[seat_id] = value
+        _binding_name, _value, binding_reset = _binding_window(capacity)
+        windows = _capacity_window_values(capacity)
+        for short, (remaining, _reset) in windows.items():
+            balances[f"{seat_id}:{short}"] = remaining
         tier = str(capacity.get("tier") or "unknown")
         stale = tier != "fresh"
         resets, missing_resets = _signal_resets(_seat_limits(seat), at=current)
         auth_failure = seat.get("auth_failure")
-        state, state_color = _provider_state(
-            seat.get("status"), claim, unhealthy=bool(auth_failure)
-        )
-        # Activity is cyan in STATE/ONGOING WORK, while capacity remains a health
-        # signal independent of whether the account is currently working.
-        health = seat_color(seat_id, {**seat, "in_flight": None}, settings)
-        if lifecycle == "inactive":
-            health = "gray"
-        elif lifecycle == "draining":
-            health = "amber"
-        if health in {"gray", "purple", "cyan"}:
-            health = "gray" if lifecycle == "inactive" else "amber"
-        if stale and health == "green":
-            health = "amber"
-        if health == "green" and not capacity["fits_small"]:
-            # Rendering and routing share one capacity verdict.
-            health = "amber"
         if seat_id in active_seat_ids and capacity["auth_ok"]:
             codex_auth += 1
         if seat_id in active_seat_ids and capacity["fits_small"]:
@@ -1251,8 +1448,8 @@ def dashboard(
                 _AttentionItem(
                     "amber",
                     attention_owner,
-                    f"capacity is {tier}",
-                    "refresh this seat's usage",
+                    f"{attention_owner} usage is {'unknown' if tier == 'unknown' else 'out of date'}",
+                    "refresh its usage",
                     f"capacity {tier}: {capacity['reason']}; source={source}",
                 )
             )
@@ -1261,8 +1458,8 @@ def dashboard(
                 _AttentionItem(
                     "red",
                     attention_owner,
-                    f"provider is {seat.get('status')}",
-                    "refresh; if needed, sign in via `codex-seat dash --manage`",
+                    f"{attention_owner} provider {_provider_problem(seat.get('status'))}",
+                    "refresh it; if that fails, sign in again via `codex-seat dash --manage`",
                     f"provider {seat.get('status')}; source={source}",
                 )
             )
@@ -1271,8 +1468,8 @@ def dashboard(
                 _AttentionItem(
                     "red",
                     attention_owner,
-                    "authentication failed",
-                    "sign in via `codex-seat dash --manage`",
+                    f"{attention_owner} authentication failed",
+                    "sign in again via `codex-seat dash --manage`",
                     f"authentication failed: {auth_failure}; source={source}",
                 )
             )
@@ -1281,21 +1478,20 @@ def dashboard(
                 _AttentionItem(
                     "amber",
                     attention_owner,
-                    "reported quota windows do not match the configured plan",
-                    "verify the configured plan in `codex-seat dash --manage`",
+                    f"{attention_owner} quota windows do not match its configured plan",
+                    "check the plan in `codex-seat dash --manage`",
                     f"{settings['pool']['seats'][seat_id]['label']} window drift: "
                     f"{capacity['profile_window_drift_reason']}",
                 )
             )
         elif seat_id in operational_seat_ids and missing_resets:
-            message = "has no authoritative reset window"
             attention.append(
                 _AttentionItem(
                     "amber",
                     attention_owner,
-                    message,
-                    "refresh this seat's usage",
-                    message,
+                    f"{attention_owner} has no reported reset time",
+                    "refresh its usage",
+                    "has no authoritative reset window",
                 )
             )
         if seat_id in operational_seat_ids and capacity.get("unverified"):
@@ -1303,8 +1499,8 @@ def dashboard(
                 _AttentionItem(
                     "amber",
                     attention_owner,
-                    "configured capacity is unverified",
-                    "verify the plan in `codex-seat dash --manage`",
+                    f"{attention_owner} plan capacity is unverified",
+                    "confirm the plan in `codex-seat dash --manage`",
                     f"{settings['pool']['seats'][seat_id]['label']} capacity unverified; "
                     "see `codex-seat seats list`",
                 )
@@ -1327,21 +1523,25 @@ def dashboard(
         )
         seat_rows.append(
             {
+                "kind": "codex",
                 "role": badges[seat_id],
                 "account": seat_id,
-                "label": configured_label,
+                "name": configured_label,
                 "plan": _codex_plan_name(settings, seat_id),
-                "multiplier": capacity.get("effective_relative_multiplier", 1.0),
-                "value": value,
-                "health": health,
+                "windows": windows,
+                "fresh": not stale,
+                "reset": binding_reset,
                 "resets": resets,
-                "binding_name": binding_name,
-                "binding_reset": binding_reset,
-                "limit_reset": _limit_reset_text(binding_name, binding_reset, at=current),
                 "missing": missing_resets,
-                "state": f"{lifecycle} · {state}",
-                "current_work": f"Running: {work_label}" if work_label else state.lstrip("○×◐· "),
-                "state_color": state_color,
+                "chip": status_chip(
+                    "codex",
+                    seat.get("status"),
+                    lifecycle=lifecycle,
+                    task=work_label,
+                    auth_failure=bool(auth_failure),
+                    exhausted=_exhausted_window(windows),
+                    stale=stale,
+                ),
                 "fit": _fit_label(capacity) if lifecycle == "active" else "—",
                 "age": _usage_age_text(age_seconds).replace("never", "—"),
                 "stale": stale,
@@ -1350,33 +1550,31 @@ def dashboard(
             }
         )
 
-    claude_binding_name, claude_value, claude_binding_reset = _claude_binding_window(
+    _claude_binding_name, _claude_value, claude_binding_reset = _claude_binding_window(
         limits
     )
-    balances["claude"] = claude_value
+    claude_windows: dict[str, tuple[float | None, float | None]] = {}
+    if mode != "off":
+        for name in ("five_hour", "seven_day"):
+            window = limits.get(name)
+            if isinstance(window, dict):
+                reset = window.get("resets_at")
+                claude_windows[window_label(name, short=True)] = (
+                    _claude_remaining(limits, name),
+                    float(reset) if isinstance(reset, (int, float)) else None,
+                )
+    for short, (remaining, _reset) in claude_windows.items():
+        balances[f"claude:{short}"] = remaining
     usage_age = claude_usage_age_seconds(limits, at=current)
     claude_stale = mode != "off" and not claude_usage_fresh(settings, limits, at=current)
     claude_resets, claude_missing = _signal_resets(
         limits, at=current, expected_names={"five_hour", "seven_day"}
     )
     claude_error = provider.get("last_error")
-    claude_state, claude_state_color = _provider_state(
-        provider.get("status"), provider.get("in_flight"),
-        disabled=mode == "off"
-    )
-    if mode == "off":
-        claude_health = "dim"
-    elif provider.get("status") != "ok" or claude_value is not None and claude_value <= 0:
-        claude_health = "red"
-    elif claude_value is None or claude_stale or claude_value <= 15:
-        claude_health = "amber"
-    else:
-        claude_health = "green"
     claude_claim = provider.get("in_flight")
     claude_tier = resolve_subscription_tier(
         settings.get("providers", {}).get("claude", {}).get("subscription_tier")
     )["label"] or "tier ?"
-    claude_account = f"claude ({claude_tier})"
     if mode != "off" and claude_stale:
         telemetry_problem = (
             "telemetry is unavailable"
@@ -1387,8 +1585,10 @@ def dashboard(
             _AttentionItem(
                 "amber",
                 "Claude",
-                telemetry_problem,
-                "refresh Claude usage",
+                "Claude usage data is unavailable"
+                if usage_age is None
+                else f"Claude usage data is {_usage_age_text(usage_age)} old",
+                "run a Claude turn or refresh Claude usage",
                 f"{telemetry_problem}; source=statusline",
             )
         )
@@ -1397,8 +1597,8 @@ def dashboard(
             _AttentionItem(
                 "red",
                 "Claude",
-                f"provider is {provider.get('status')}",
-                "restore Claude authentication, then refresh usage",
+                f"Claude provider {_provider_problem(provider.get('status'))}",
+                "sign in to Claude again, then refresh usage",
                 f"provider {provider.get('status')}; source=statusline",
             )
         )
@@ -1407,8 +1607,8 @@ def dashboard(
             _AttentionItem(
                 "red",
                 "Claude",
-                "provider reported an error",
-                "resolve the provider error, then refresh usage",
+                "Claude provider reported an error",
+                "fix it, then refresh usage",
                 f"provider error: {claude_error}; source=statusline",
             )
         )
@@ -1417,7 +1617,7 @@ def dashboard(
             _AttentionItem(
                 "amber",
                 "Claude",
-                "a required reset window is missing",
+                "Claude is missing a reset window",
                 "refresh Claude usage",
                 "missing reset window",
             )
@@ -1443,27 +1643,25 @@ def dashboard(
     )
     seat_rows.append(
         {
+            "kind": "claude",
             "role": "C",
             "account": "claude",
-            "display_account": claude_account,
-            "value": claude_value,
-            "health": claude_health,
+            "name": "claude",
+            "plan": claude_tier,
+            "mode": mode,
+            "windows": claude_windows,
+            "fresh": not claude_stale,
+            "reset": claude_binding_reset if mode != "off" else None,
             "resets": claude_resets if mode != "off" else "—",
-            "binding_name": claude_binding_name if mode != "off" else None,
-            "binding_reset": claude_binding_reset if mode != "off" else None,
-            "limit_reset": (
-                _limit_reset_text(claude_binding_name, claude_binding_reset, at=current)
-                if mode != "off"
-                else "not applicable"
-            ),
             "missing": claude_missing and mode != "off",
-            "state": claude_state,
-            "current_work": (
-                f"Running: {claude_work_label}"
-                if claude_work_label
-                else claude_state.lstrip("○×◐· ")
+            "chip": status_chip(
+                "claude",
+                provider.get("status"),
+                mode=mode,
+                task=claude_work_label,
+                exhausted=_exhausted_window(claude_windows),
+                stale=claude_stale,
             ),
-            "state_color": claude_state_color,
             "fit": _fit_label(claude_capacity),
             "age": _usage_age_text(usage_age).replace("never", "—") if mode != "off" else "—",
             "stale": claude_stale,
@@ -1487,21 +1685,21 @@ def dashboard(
             _AttentionItem(
                 "red",
                 "Refresh",
-                "the active refresh failed",
-                "inspect the result and retry the refresh",
+                "The last refresh failed",
+                "check the result, then refresh again",
                 f"active refresh failed: {result}",
             )
         )
     warning_attention: list[_AttentionItem] = []
     for warning in _settings_warning_lines(warnings, forensic=forensic):
-        housekeeping = warning.startswith("settings unknown keys:")
+        housekeeping = warning.startswith("Settings file has ")
         priority = warning.startswith("WARNING:")
         warning_attention.append(
             _AttentionItem(
                 "amber" if housekeeping else "red",
                 "Global",
                 warning,
-                "follow the warning guidance",
+                "",
                 warning,
                 priority=priority,
             )
@@ -1512,26 +1710,9 @@ def dashboard(
     other_warnings = [item for item in warning_attention if not item.priority]
     attention = [*priority_warnings, *attention, *other_warnings]
 
-    refreshing = bool(_snapshot_value(refresh_snapshot, "refreshing", False))
-    if refreshing:
-        live_text, live_color = "↻ REFRESHING", "cyan"
-    elif refresh_snapshot is not None:
-        live_text, live_color = "● LIVE", "cyan"
-    else:
-        live_text, live_color = "○ CACHED", "dim"
-    success_at = _snapshot_value(refresh_snapshot, "last_success_at")
-    if not isinstance(success_at, (int, float)):
-        recent_ok = succeeded is True if succeeded != "unset" else _refresh_succeeded(result)
-        if recent_ok:
-            success_at = _snapshot_value(refresh_snapshot, "last_finished_at")
-    last_ok = "—" if not isinstance(success_at, (int, float)) else _usage_age_text(current - float(success_at))
-    next_due = _snapshot_value(refresh_snapshot, "next_due")
-    if refreshing:
-        next_text = "after refresh"
-    elif isinstance(next_due, (int, float)):
-        next_text = _countdown(current + max(0.0, float(next_due) - current_monotonic), at=current)
-    else:
-        next_text = "pending"
+    live_parts, freshness_text = live_header(
+        refresh_snapshot, current=current, monotonic_at=current_monotonic
+    )
     background_ids = {
         str(job.get("request_id"))
         for job in background_jobs
@@ -1563,217 +1744,110 @@ def dashboard(
             _AttentionItem(
                 "red",
                 "Work queue",
-                f"background jobs need attention ({', '.join(descriptions)})",
-                "inspect the affected job receipts before retrying",
+                f"Background jobs need attention ({', '.join(descriptions)})",
+                "inspect their receipts before retrying",
                 f"background states: {', '.join(descriptions)}",
             )
         )
+    local_rows = _local_seat_rows(root, settings, background_jobs, at=current)
+    attention.extend(_local_attention(local_rows))
     grouped_attention, problem_count = _group_attention(attention, forensic=forensic)
 
-    running_jobs = background_counts.get("running", 0) + len(active_rows)
-    queued_jobs = background_counts.get("queued", 0)
-    waiting_jobs = background_counts.get("capacity", 0)
+    # The header strip uses the one shared summary rule (capacity, manager).
+    strip = pool_view.summary(
+        pool_view.collect(root, settings, current, snapshot=snapshot, jobs=background_jobs)
+    )
+    running_jobs = strip["running"]
+    queued_jobs = strip["queued"]
+    waiting_jobs = strip["waiting_capacity"]
     active_total = len(active_seat_ids)
-    ready = operator["healthy"] if operator else codex_fits_small
-    local_time = datetime.fromtimestamp(current).astimezone().strftime("%H:%M:%S")
+    ready, ready_total = strip["ready"], strip["total"]
     compact = width < 100
-    roomy = width >= 140
-    title = "CXWATCH" if compact else "CXWATCH SIGNAL TABLE"
-    if width >= 90:
-        summary_lines = [
-            _line(
-                [
-                    (f"Seats ready {ready}/{active_total}", "green" if ready == active_total else "amber"),
-                    (
-                        f" · Jobs {running_jobs} running, {queued_jobs} queued, "
-                        f"{waiting_jobs} waiting for capacity",
-                        None,
-                    ),
-                    (f" · Problems {problem_count}", "green" if problem_count == 0 else "red"),
-                ],
-                width,
-                color,
-            )
-        ]
-    else:
-        summary_lines = [
-            _line(
-                [
-                    (f"Seats ready {ready}/{active_total}", "green" if ready == active_total else "amber"),
-                    (f" · Problems {problem_count}", "green" if problem_count == 0 else "red"),
-                ],
-                width,
-                color,
-            ),
-            _line(
-                [
-                    (
-                        f"Jobs: {running_jobs} running · {queued_jobs} queued · "
-                        f"{waiting_jobs} waiting for capacity",
-                        None,
-                    )
-                ],
-                width,
-                color,
-            ),
-        ]
     dense = width < 60
-    lines = [
-        _line(
-            [
-                (title, "cyan"),
-                ("  ", None),
-                (local_time, "dim"),
-                (" local · ", None),
-                (live_text, live_color),
-                (f" · last ok {last_ok} · next {next_text}", "dim"),
-            ],
-            width,
-            color,
-        ),
-        *summary_lines,
-        *([] if dense else [""]),
-    ]
-
-    if not compact:
-        widths = {
-            "role": 4,
-            "account": 34,
-            "remaining": 18,
-            "limit / reset": 20,
-            "activity": 15,
-            "routing fit": 13 if roomy else 4,
-            "age": 6,
-        }
-        header: list[tuple[str, str | None]] = []
-        for index, (name, cell_width) in enumerate(widths.items()):
-            if index:
-                header.append((" ", None))
-            heading = (
-                "SEAT (PLAN)"
-                if name == "account"
-                else "FIT"
-                if name == "routing fit" and not roomy
-                else name.upper()
-            )
-            header.extend(_cell(heading, cell_width, style="dim"))
-        lines.append(_line(header, width, color))
-        for row in seat_rows:
-            parts: list[tuple[str, str | None]] = []
-            parts.extend(_cell(row["role"], widths["role"]))
-            parts.append((" ", None))
-            if row["account"] == "claude":
-                account = row["display_account"]
-            else:
-                account = f"{row['label']} ({row['plan']})"
-            parts.extend(_cell(account, widths["account"]))
-            parts.append((" ", None))
-            parts.extend(
-                _capacity_parts(
-                    row["value"],
-                    deltas.get(row["account"]),
-                    row["health"],
-                    widths["remaining"],
-                )
-            )
-            parts.append((" ", None))
-            parts.extend(
-                _cell(
-                    row["limit_reset"],
-                    widths["limit / reset"],
-                    style="amber" if row["missing"] else "dim",
-                )
-            )
-            parts.append((" ", None))
-            parts.extend(_cell(row["state"], widths["activity"], style=row["state_color"]))
-            parts.append((" ", None))
-            parts.extend(
-                _cell(
-                    _fit_text(row["fit"], expanded=roomy),
-                    widths["routing fit"],
-                    style="dim" if row["fit"] == "—" else None,
-                )
-            )
-            parts.append((" ", None))
-            parts.extend(_cell(("~" if row["stale"] and row["age"] != "—" else "") + row["age"], widths["age"], align="right", style="amber" if row["stale"] else "dim"))
-            lines.append(_line(parts, width, color))
-    else:
-        for row in seat_rows:
-            if row["account"] == "claude":
-                account = (
-                    f"C {claude_tier}" if dense else row["display_account"]
-                )
-            else:
-                account = f"{row['label']} ({row['plan']})"
-            remaining_text = "?%" if row["value"] is None else f"{row['value']:g}%"
-            readiness = _fit_text(row["fit"], expanded=True)
-            if dense:
-                ready_text = "ready" if row["fit"] in {"S", "S+B"} else "not ready"
-                readiness_part = (ready_text, "green" if ready_text == "ready" else "amber")
-                remaining_part = (f"{remaining_text} remaining", row["health"])
-                status_parts = (
-                    [remaining_part, (" · ", None), readiness_part]
-                    if row["account"] == "claude"
-                    else [readiness_part, (" · ", None), remaining_part]
-                )
-                lines.append(
-                    _line(
-                        [
-                            (account, None),
-                            (f" ({row['role']}) · ", "dim"),
-                            *status_parts,
-                            (" · ", None),
-                            (row["current_work"], row["state_color"]),
-                        ],
-                        width,
-                        color,
-                    )
-                )
-            else:
-                lines.append(
-                    _line(
-                        [
-                            (account, None),
-                            (f" ({row['role']}) · ", "dim"),
-                            (readiness, "dim" if row["fit"] == "—" else None),
-                            (" · ", None),
-                            (f"{remaining_text} remaining", row["health"]),
-                        ],
-                        width,
-                        color,
-                    )
-                )
-                lines.append(
-                    _line(
-                        [
-                            ("  ", None),
-                            (row["current_work"], row["state_color"]),
-                            (" · limit ", "dim"),
-                            (row["limit_reset"], "amber" if row["missing"] else "dim"),
-                        ],
-                        width,
-                        color,
-                    )
-                )
-        if dense:
-            lines.append(
-                _line([("Details: widen or use --forensic", "dim")], width, color)
-            )
+    layout = _table_layout(width)
 
     from .account import banked_reset_report
+
+    bank_parts: list[str] = []
+    bank_unsure: dict[str, list[str]] = {}
     for row in seat_rows:
-        if row["account"] == "claude":
+        if row["kind"] != "codex":
             continue
         bank = banked_reset_report(row["raw"], settings, current, root=root, seat_id=row["account"])
         if bank["status"] == "unknown" and bank["available_count"] is None:
             continue
-        count = bank["available_count"] if bank["status"] == "fresh" else "?"
-        lines.append(_line([("  ", None), (row["account"], "dim"),
-                            (f" banked resets: {count} ({bank['status']})", "dim")], width, color))
+        if bank["status"] == "fresh" and isinstance(bank["available_count"], int):
+            bank_parts.append(f"{row['account']} {bank['available_count']}")
+        else:
+            label = human("bank_status", bank["status"]).lower()
+            bank_unsure.setdefault(label, []).append(row["account"])
+    bank_parts += [
+        f"count {label} for {', '.join(accounts)}" for label, accounts in bank_unsure.items()
+    ]
+
+    summary_parts: list[tuple[str, str | None]] = [
+        (f"Ready {ready}/{ready_total}", "ok" if ready == ready_total else "warn"),
+        (" · ", "muted"),
+        (f"Running {running_jobs}", "live" if running_jobs else None),
+        (" · ", "muted"),
+        (f"Queued {queued_jobs}", None),
+    ]
+    if waiting_jobs:
+        summary_parts += [(" · ", "muted"), (f"Waiting {waiting_jobs}", "warn")]
+    summary_parts += [
+        (" · ", "muted"),
+        (f"Problems {problem_count}", "ok" if problem_count == 0 else "bad"),
+    ]
+    if strip["banked_resets"] is not None:
+        summary_parts += [(" · ", "muted"), (f"Resets {strip['banked_resets']}", None)]
+    header_lines = [
+        _line(parts, width, color)
+        for parts in header_parts(live_parts, summary_parts, freshness_text, width)
+    ]
+    lines = [*header_lines, *([] if dense else [""])]
+
+    if layout is not None:
+        lines.append(_line(_table_header(layout), width, color))
+    codex_rows = [row for row in seat_rows if row["kind"] == "codex"]
+    claude_rows = [row for row in seat_rows if row["kind"] == "claude"]
+
+    def render_rows(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            for parts in _seat_row_lines(row, layout, deltas, width=width, at=current):
+                lines.append(_line(parts, width, color))
+
+    primary = next((row["account"] for row in codex_rows if row["role"] == "P"), None)
+    lines.append(
+        _line(
+            [
+                (f"CODEX {len(codex_rows)}", "heading"),
+                (f" · primary {primary} is used last" if primary else "", "muted"),
+            ],
+            width,
+            color,
+        )
+    )
+    render_rows(codex_rows)
+    if bank_parts:
+        lines.append(
+            _line([("  Banked resets  ", "muted"), (" · ".join(bank_parts), "muted")], width, color)
+        )
+    if not dense:
+        lines.append("")
+    claude_mode_text = human("claude_mode", seat_rows[-1]["mode"])
+    lines.append(
+        _line(
+            [(f"CLAUDE {len(claude_rows)}", "heading"), (f" · {claude_mode_text}", "muted")],
+            width,
+            color,
+        )
+    )
+    render_rows(claude_rows)
+    if dense:
+        lines.append(_line([("Details: widen or use --forensic", "muted")], width, color))
 
     sections: dict[str, tuple[int, int]] = {"providers": (0, len(lines))}
 
-    local_rows = _local_seat_rows(root, settings, background_jobs, at=current)
     local_start = len(lines)
     if local_rows:
         local_ready = sum(row["key"] == "ready" for row in local_rows)
@@ -1783,100 +1857,49 @@ def dashboard(
         lines.append(
             _line(
                 [
-                    ("LOCAL SEATS", "purple"),
-                    (f" · ready {local_ready}/{len(local_rows)}", "green" if local_ready else "dim"),
-                    (f" · global {local_global}", "dim" if local_global == "off" else None),
+                    (f"LOCAL {len(local_rows)}", "heading"),
+                    (f" · ready {local_ready}/{len(local_rows)}", "ok" if local_ready else "muted"),
+                    (f" · global {human('local_mode', local_global)}", "muted"),
                 ],
                 width,
                 color,
             )
         )
-        if not compact:
-            local_widths = {
-                "host/seat": 20,
-                "model": 16,
-                "mode": 13,
-                "state": 15,
-                "probe": 6,
-            }
-            local_header: list[tuple[str, str | None]] = []
-            for index, (name, cell_width) in enumerate(local_widths.items()):
-                if index:
-                    local_header.append((" ", None))
-                local_header.extend(
-                    _cell(name.upper(), cell_width, style="dim", align="right" if name == "probe" else "left")
-                )
-            local_header.append((" ", None))
-            local_header.append(("DETAIL", "dim"))
-            lines.append(_line(local_header, width, color))
-            for row in local_rows:
-                parts: list[tuple[str, str | None]] = []
-                parts.extend(_cell(row["name"], local_widths["host/seat"]))
-                parts.append((" ", None))
-                parts.extend(_cell(row["model"], local_widths["model"], style="dim"))
-                parts.append((" ", None))
-                parts.extend(
-                    _cell(
-                        row["mode"],
-                        local_widths["mode"],
-                        style="dim" if row["mode"] == "off" else None,
-                    )
-                )
-                parts.append((" ", None))
-                parts.extend(_cell(row["state"], local_widths["state"], style=row["style"]))
-                parts.append((" ", None))
-                parts.extend(
-                    _cell(
-                        ("~" if row["stale"] and row["age_text"] != "—" else "") + row["age_text"],
-                        local_widths["probe"],
-                        align="right",
-                        style="amber" if row["stale"] else "dim",
-                    )
-                )
-                parts.append((" ", None))
-                parts.append((row["detail"], "dim"))
-                lines.append(_line(parts, width, color))
-        else:
-            for row in local_rows:
-                if dense:
-                    parts = [
-                        (row["name"], None),
-                        (" · ", None),
-                        (row["state"].lstrip("○×◐●↻~?· "), row["style"]),
-                        (" · ", None),
-                        (("~" if row["stale"] else "") + row["age_text"], "amber" if row["stale"] else "dim"),
-                    ]
-                else:
-                    parts = [
-                        (row["name"], None),
-                        (f" · {row['model']} · ", "dim"),
-                        (row["mode"], "dim" if row["mode"] == "off" else None),
-                        (" · ", None),
-                        (row["state"], row["style"]),
-                        (" · probe ", "dim"),
-                        (("~" if row["stale"] else "") + row["age_text"], "amber" if row["stale"] else "dim"),
-                        *(([(f" · {row['detail']}", "dim")]) if row["detail"] else []),
-                    ]
-                lines.append(_line(parts, width, color))
+        names = [_local_name(row) for row in local_rows]
+        render_rows(
+            [
+                _local_table_row(row, name if names.count(name) == 1 else f"{name} ({row['seat']})")
+                for row, name in zip(local_rows, names)
+            ]
+        )
     sections["local"] = (local_start, len(lines))
 
     attention_start = len(lines)
     if grouped_attention:
         if not dense:
             lines.append("")
-        lines.append(_line([("ATTENTION", "amber")], width, color))
+        lines.append(_rule("NEEDS ATTENTION", str(len(grouped_attention)), width, color, role="warn"))
         for style, message in grouped_attention:
-            lines.append(_line([("  ! ", style), (message, None)], width, color))
+            lines.append(_line([("! ", style), (message, None)], width, color))
     sections["attention"] = (attention_start, len(lines))
 
     ongoing_start = len(lines)
     if not dense:
         lines.append("")
-    lines.append(_line([("ONGOING WORK", "cyan")], width, color))
+    ongoing_total = len(background_jobs) + len(active_rows)
+    lines.append(
+        _rule(
+            "ONGOING WORK",
+            f"{running_jobs} running" if ongoing_total else "",
+            width,
+            color,
+            role="accent",
+        )
+    )
     if background_error:
-        lines.append(_line([("  unavailable", "red")], width, color))
+        lines.append(_line([("  unavailable", "bad")], width, color))
     elif not background_jobs and not active_rows:
-        lines.append(_line([("  none", "dim")], width, color))
+        lines.append(_line([("  none", "muted")], width, color))
     state_order = {
         "running": 0,
         "queued": 1,
@@ -1889,27 +1912,26 @@ def dashboard(
         provider_text = str(job.get("provider") or job.get("requested_provider") or "?")
         if job.get("seat"):
             provider_text += f"/{job['seat']}"
-        elapsed = int(job.get("elapsed_seconds", 0) or 0)
-        elapsed_text = f"{elapsed // 60}m{elapsed % 60:02d}s" if elapsed >= 60 else f"{elapsed}s"
-        state_text, state_color = _work_state(job.get("state"))
+        elapsed_text = duration(job.get("elapsed_seconds", 0) or 0)
+        chip = status_chip("work", job.get("state"))
         task_width = max(
             8,
             width
-            - _display_width(state_text)
+            - display_width(chip.label)
             - (5 if compact else 45),
         )
-        task_name = _plain_clip(str(job.get("label") or "managed job"), task_width)
+        task_name = clip(str(job.get("label") or "managed job"), task_width)
         ongoing_rows.append(
             (
                 state_order.get(str(job.get("state")), 5),
                 f"0:{str(job.get('request_id') or '')}",
                 [
-                    ("  ", None),
-                    (task_name, "cyan"),
+                    (f"{chip.glyph} ", chip.role),
+                    (task_name, "accent"),
                     (" · ", None),
-                    (state_text, state_color),
+                    (chip.label, chip.role),
                     (f" · {provider_text} · {job['kind']}/{job['size']} · {elapsed_text}", None),
-                    (f" · id {str(job.get('request_id') or '?')[:8]}", "dim"),
+                    (f" · job {str(job.get('request_id') or '?')[:8]}", "muted"),
                 ],
             )
         )
@@ -1933,19 +1955,19 @@ def dashboard(
             else raw_label or f"Managed {claim.get('kind') or 'work'}"
         )
         task_width = max(8, width - len("Running") - (5 if compact else 45))
-        task_name = _plain_clip(task_name, task_width)
+        task_name = clip(task_name, task_width)
         ongoing_rows.append(
             (
                 state_order["running"],
                 f"1:{role}:{task_name}",
                 [
-                    ("  ", None),
-                    (task_name, "cyan"),
+                    ("● ", "live"),
+                    (task_name, "accent"),
                     (" · ", None),
-                    ("Running", "cyan"),
+                    ("Running", "live"),
                     (f" · {role} · {claim.get('kind') or 'work'} · ", None),
                     (f"{token_text} · {context_text} · {_elapsed(claim.get('started_at'), at=current)}", None),
-                    *(([(f" · id {claim_id[:8]}", "dim")]) if claim_id else []),
+                    *(([(f" · job {claim_id[:8]}", "muted")]) if claim_id else []),
                 ],
             )
         )
@@ -1958,28 +1980,25 @@ def dashboard(
     history = _terminal_history(snapshot.get("jobs", []))
     history_start = len(lines)
     if history:
-        lines.extend(("", _line([("HISTORY", "dim")], width, color)))
+        lines.extend(("", _rule("RECENT", f"last {len(history)}", width, color, role="muted")))
         for group in history:
             job = group["job"]
-            timestamp = _job_ts(job)
-            time_text = datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M") if timestamp else "--:--"
             seat_ref = str(job.get("seat") or "")
             if job.get("provider") == "local":
                 role = f"L:{seat_ref}" if seat_ref else "L"
             else:
-                role = "C" if job.get("provider") == "claude" else (seat_ref or "?")
+                role = "claude" if job.get("provider") == "claude" else (seat_ref or "?")
             status_text, status_color = _history_status(str(job.get("status") or "unknown"))
             repeat = f" ×{group['count']}" if group["count"] > 1 else ""
-            model = f"[{job['model']}] · " if job.get("model") else ""
             lines.append(
                 _line(
                     [
-                        (f"  {time_text} ", "dim"),
-                        (f"{role} ", None),
+                        (f"{clock(_job_ts(job), current)}  ", "muted"),
                         (status_text + repeat, status_color),
-                        (f" · {fmt_tokens(int(job.get('tokens', 0) or 0))} · ", None),
-                        (model, "dim"),
-                        (str(job.get("label") or "-"), None),
+                        (f" {role:<8} ", None),
+                        (f"{fmt_tokens(int(job.get('tokens', 0) or 0)):>6} tokens  ", None),
+                        (f"{job['model']}  " if job.get("model") else "", "muted"),
+                        (_history_label(job.get("label")), None),
                     ],
                     width,
                     color,

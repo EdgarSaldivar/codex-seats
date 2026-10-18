@@ -150,6 +150,36 @@ class AccountTelemetryTests(unittest.TestCase):
             self.assertIsNone(stale["observed_plan_type"])
             self.assertIn("login changed", stale["reason"])
 
+    def test_fresh_identity_without_trustworthy_timestamp_reports_stale(self):
+        from codex_seats.account import _auth_file_fingerprint
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_settings(root, registry_settings())
+            home = root / "seat1"
+            home.mkdir()
+            (home / "auth.json").write_text("login")
+            fingerprint = _auth_file_fingerprint(home)
+            now = time.time()
+            cases = {
+                "missing": None, "future": now + 3600, "bool": True,
+                "non-finite": float("nan"), "recent": now - 60,
+            }
+            for label, observed_at in cases.items():
+                with self.subTest(label):
+                    with Ledger(root) as data:
+                        data.setdefault("seats", {})["seat1"] = {"manager_identity": {
+                            "schema": 1, "status": "fresh", "email": "seat@example.test",
+                            "observed_at": observed_at,
+                            "auth_file_fingerprint": fingerprint, "reason": None,
+                        }}
+                    report = manager_identity_report(root, registry_settings(), "seat1")
+                    expected = "fresh" if label == "recent" else "stale"
+                    self.assertEqual(report["status"], expected)
+                    self.assertEqual(report["email"], "seat@example.test")
+                    if expected == "stale":
+                        self.assertIn("freshness window", report["reason"])
+
     def test_transient_identity_failure_marks_same_login_stale(self):
         seat = new_seat()
         fingerprint = {

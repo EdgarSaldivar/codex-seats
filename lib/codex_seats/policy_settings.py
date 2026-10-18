@@ -21,18 +21,12 @@ DEFAULTS: dict[str, Any] = {
     "execution.inline_max_minutes": 5,
     "execution.head_permissions": "full-access",
     "execution.head_worker_fallback": True,
-    "ui.theme": "system",
-    "ui.density": "comfortable",
-    "ui.accent": "teal",
 }
 CHOICES = {
     "review.mode": {"off", "advisory", "blocking"},
     "review.strategy": {"single", "cross"},
     "execution.delegation_policy": {"auto", "always", "manual"},
     "execution.head_permissions": {"safe", "full-access"},
-    "ui.theme": {"system", "light", "dark"},
-    "ui.density": {"comfortable", "compact"},
-    "ui.accent": {"teal", "indigo"},
 }
 
 

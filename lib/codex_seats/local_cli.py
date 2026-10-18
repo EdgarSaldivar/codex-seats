@@ -100,15 +100,14 @@ def _trusted_terminal(args, action):
 def _manager_terminal(args, action):
     """Internal write path for the trusted interactive manager; not a CLI path.
 
-    Allowed only when ``seat_manager.ensure_management_eligible()`` passes, i.e.
-    a real stdin/stdout TTY outside controller/head and managed-worker contexts
-    (a pseudo-terminal in those contexts is still refused), and only after the
+    Allowed only when ``seat_manager.ensure_not_managed_worker()`` passes (a
+    managed worker is refused even on a pseudo-terminal), and only after the
     manager marked the write as an explicitly confirmed current request.
     """
-    from .seat_manager import ManagerEligibilityError, ensure_management_eligible
+    from .seat_manager import ManagerEligibilityError, ensure_not_managed_worker
 
     try:
-        ensure_management_eligible()
+        ensure_not_managed_worker()
     except ManagerEligibilityError as exc:
         raise ValueError(f"{action} refused: {exc}") from exc
     if not getattr(args, "from_current_user_request", False):
@@ -242,8 +241,7 @@ def mutate(root, args, *, authority=None):
     guards are unchanged: host probe/config commands require a trusted
     controller terminal. ``MANAGER_AUTHORITY`` is the distinct internal path of
     the trusted interactive manager (``_manager_terminal``): every write must
-    pin the previewed digest and is refused for controller/head and managed
-    workers even on a PTY. ``MANAGER_ACTIONS`` are written only through
+    pin the previewed digest and is refused for managed workers even on a PTY. ``MANAGER_ACTIONS`` are written only through
     ``MANAGER_AUTHORITY``.
     """
     if authority not in (None, MANAGER_AUTHORITY):

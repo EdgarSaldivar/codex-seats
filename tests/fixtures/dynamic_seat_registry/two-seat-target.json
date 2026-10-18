@@ -22,8 +22,7 @@
           "capacity_verified_at": "2026-09-03T00:00:00Z"
         }
       },
-      "primary": "seat1",
-      "deputy": "seat2"
+      "primary": "seat1"
     }
   },
   "status": {
@@ -46,7 +45,7 @@
       },
       "seat2": {
         "label": "Standard",
-        "role": "deputy",
+        "role": "worker",
         "relative_capacity": 1.0,
         "binding_available_baseline_units": 80.0,
         "binding_usable_baseline_units": 80.0,
@@ -55,10 +54,10 @@
     }
   },
   "dashboard_contains": [
-    "Seats ready 2/2",
+    "Ready 2/2",
     "Premium",
     "Standard",
-    "small + big"
+    "small+big"
   ],
   "segment_contains": [
     "H:2/2",
@@ -68,8 +67,8 @@
   ],
   "resets_contains": [
     "2 healthy / 2 active",
-    "Premium · business-premium",
-    "Standard · business-standard",
+    "Premium · Premium 5x",
+    "Standard · Standard 1x",
     "available=400, usable=400",
     "available=80, usable=80"
   ]

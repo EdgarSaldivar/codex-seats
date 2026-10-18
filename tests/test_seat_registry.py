@@ -46,7 +46,7 @@ def test_new_install_defaults_require_explicit_onboarding():
     assert settings["schema"] == 3
     assert settings["pool"]["seats"] == {}
     assert settings["pool"]["primary"] is None
-    assert settings["pool"]["deputy"] is None
+    assert "deputy" not in settings["pool"]
     validate_schema3(settings)
 
 
@@ -65,8 +65,6 @@ def test_strict_ids_and_numeric_sorting_are_unbounded():
 @pytest.mark.parametrize("count", [0, 1, 2, 5, 6, 12])
 def test_schema3_accepts_arbitrary_registry_counts(count, tmp_path):
     settings = _registry(count)
-    if count > 1:
-        settings["pool"]["deputy"] = "seat2"
     validate_schema3(settings, tmp_path)
     assert registered_seat_ids(settings) == [
         f"seat{number}" for number in range(1, count + 1)
@@ -75,6 +73,7 @@ def test_schema3_accepts_arbitrary_registry_counts(count, tmp_path):
 
 def test_roles_selectors_and_homes_are_derived_without_io(tmp_path):
     settings = _registry(6)
+    # A stray legacy deputy never yields a deputy role.
     settings["pool"]["deputy"] = "seat4"
     settings["pool"]["seats"]["seat3"]["lifecycle"] = "inactive"
     settings["pool"]["seats"]["seat6"]["home"] = "/var/local/codex-seat6"
@@ -82,7 +81,7 @@ def test_roles_selectors_and_homes_are_derived_without_io(tmp_path):
     assert derive_roles(settings) == {
         "seat1": "primary",
         "seat2": "worker",
-        "seat4": "deputy",
+        "seat4": "worker",
         "seat5": "worker",
         "seat6": "worker",
     }
@@ -136,7 +135,6 @@ def test_schema3_rejects_fixed_topology_keys(tmp_path):
     "mutate, message",
     [
         (lambda settings: settings["pool"].update(primary=None), "primary"),
-        (lambda settings: settings["pool"].update(deputy="seat1"), "distinct"),
         (
             lambda settings: settings["pool"]["seats"].update(seat01=_entry()),
             "invalid seat id",
@@ -159,7 +157,6 @@ def test_schema3_rejects_fixed_topology_keys(tmp_path):
 )
 def test_schema3_rejects_invariant_violations(tmp_path, mutate, message):
     settings = _registry(2)
-    settings["pool"]["deputy"] = "seat2"
     mutate(settings)
     with pytest.raises(SeatRegistryError, match=message):
         validate_schema3(settings, tmp_path)

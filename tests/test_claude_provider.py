@@ -78,7 +78,7 @@ class ClaudeModeAndIsolationTests(unittest.TestCase):
                     "codex",
                 )
 
-    def test_provider_activation_requires_interactive_terminal_and_request(self):
+    def test_provider_activation_is_open_to_agents_but_not_managed_workers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = SimpleNamespace(
@@ -96,9 +96,9 @@ class ClaudeModeAndIsolationTests(unittest.TestCase):
                 ),
                 mock.patch("sys.stdin.isatty", return_value=True),
             ):
-                # interactive terminal but no explicit request -> rejected
-                self.assertEqual(cmd_provider_set(args, default_settings()), 2)
-                # interactive terminal + explicit request -> accepted
+                # no explicit request flag -> accepted (the flag is optional now)
+                self.assertEqual(cmd_provider_set(args, default_settings()), 0)
+                # the legacy flag is still accepted
                 args.from_current_user_request = True
                 self.assertEqual(cmd_provider_set(args, default_settings()), 0)
             settings = json.loads((root / "settings.json").read_text())
@@ -121,7 +121,7 @@ class ClaudeModeAndIsolationTests(unittest.TestCase):
                     [{"prompt": "historical", "provider": "claude"}],
                 )
                 self.assertEqual(data["disabled_queue"], [{"prompt": "older"}])
-            # non-interactive context (managed worker / automation) -> rejected even with the flag
+            # a non-interactive agent shell may enable it; a managed worker may not
             with (
                 mock.patch("codex_seats.cli.ROOT", root),
                 mock.patch.dict(
@@ -130,7 +130,16 @@ class ClaudeModeAndIsolationTests(unittest.TestCase):
                 mock.patch("sys.stdin.isatty", return_value=False),
             ):
                 args.mode = "opportunistic"
-                self.assertEqual(cmd_provider_set(args, default_settings()), 2)
+                self.assertEqual(cmd_provider_set(args, default_settings()), 0)
+            for worker in ({"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}):
+                with (
+                    mock.patch("codex_seats.cli.ROOT", root),
+                    mock.patch.dict(os.environ, worker, clear=True),
+                ):
+                    args.mode = "manual_only"
+                    self.assertEqual(cmd_provider_set(args, default_settings()), 2)
+            settings = json.loads((root / "settings.json").read_text())
+            self.assertEqual(settings["providers"]["claude"]["mode"], "opportunistic")
 
     def test_settings_and_scrub_environment(self):
         with tempfile.TemporaryDirectory() as directory:

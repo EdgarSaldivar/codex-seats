@@ -65,7 +65,6 @@ def _pool(tmp_path, count: int, *, now: float) -> dict:
         f"seat{number}": _entry(number) for number in range(1, count + 1)
     }
     settings["pool"]["primary"] = "seat1" if count else None
-    settings["pool"]["deputy"] = "seat2" if count > 1 else None
     (tmp_path / "settings.json").write_text(json.dumps(settings))
     for number in range(1, count + 1):
         home = tmp_path / f"seat{number}"
@@ -172,8 +171,8 @@ def test_lifecycle_all_view_and_narrow_operator_outputs(tmp_path):
 
     narrow = dashboard(tmp_path, settings, [], color=False, width=50, height=12, at=now)
     assert all(len(line) <= 50 for line in narrow.splitlines())
-    assert "Seats ready 2/2" in narrow
-    assert "Premium (Premium 5x)" in narrow
+    assert "Ready 2/2" in narrow
+    assert "P Premium Premium 5x" in narrow
     tmux = segment(tmp_path, settings, plain=True)
     assert "H:2/2" in tmux and "Premium(seat1)@5x" in tmux
     resets = json.loads(resets_status_json(tmp_path, settings))

@@ -1,337 +1,346 @@
 # Terminal seat manager
 
-The seat manager is part of the existing cached-first dashboard. Run
-`codex-seat dash --watch` and press `m`, or enter it directly with
-`codex-seat dash --manage`. The external `cxw` alias needs no change when it
-already runs `dash --watch`.
+The seat manager is an ops view of every seat in the pool: Codex seats, the
+Claude account and local seats. It is for **visibility, diagnosis and light
+management** — seeing where work can run, why a seat is not taking work, and
+making small reversible changes such as pausing a seat or editing its plan. It
+is not an approval layer: ordinary changes apply on the keypress.
 
-`codex-seat ui` starts a local browser manager on a random `127.0.0.1` port;
-`--port N` chooses the port, `--no-open` prints the URL, and `--no-active-probe`
-disables scheduled provider refreshes. Open the printed URL for your own local
-session, keep the launching terminal open, and do not share that link. The
-browser shows cached seats, Claude and local status, and guarded previews. Seat
-login remains in the terminal manager because it requires an interactive
-provider authentication handoff. The browser has no command runner or remote
-access endpoint.
+Open it from the dashboard with `codex-seat dash --watch` and `m`, or directly
+with `codex-seat dash --manage`. The external `cxw` alias needs no change when
+it already runs `dash --watch`.
 
-## Terminal and authority boundary
+## Layout
 
-Management is enabled only when both stdin and stdout are a real TTY in a trusted
-human shell. An explicit `--manage` request fails in captured output and in every
-controller/head or managed-worker context, including a pseudo-terminal. Ordinary
-one-shot and captured watch output remains compatible and read-only.
+Every manager screen has the same frame:
 
-The regular overview's
-summary is deliberately operational: seats ready, jobs running/queued/waiting
-for capacity, and grouped problems. The table pairs remaining usage with its
-limiting reported quota window/reset, and all live jobs appear task-first in one
-deduplicated **Ongoing work** section. Narrow terminals prioritize seat name,
-remaining usage, and current work; `--forensic` retains full diagnostics,
-lifecycle totals, and concurrency ceilings. Settings must be the schema-3 seat
-registry; an older or invalid document is shown as a settings warning and no
-capacity is synthesized from it. Seats are identified by their stable `seatN`
-id; the role column shows a P/D/W badge for primary, deputy, and worker.
+```
+codex-seats  ● LIVE 13:54   Ready 4/6 · Running 1 · Queued 0 · Next → seat2 · Resets 2      updated 12s ago
+▸ Inventory  Codex seats  Local hosts  Local seats  Claude
 
-## Keys and workflow
+    SEAT                  5H LEFT     7D LEFT     RESET   STATUS         │ seat1  Primary · Premium 5x
+CODEX 5 · primary seat1 is used last                                     │ ◐ Capped by the 7-day window
+▌ P seat1 Premium 5x      ███▉░  64%  ░░░░░   0%  6d04h   ◐ capped 7d    │ ── USAGE ──────── updated 3m ago ──
+  W seat2 Standard 1x     █████  92%  ████▏  68%  4h10m   ○ idle         │ 5-hour  ███████▋░░░░  64%  resets in 2h15m
+  W seat3 Standard 1x     ██▌░░  42%  ████▎  71%  2h15m   ● Refactor dis…│ 7-day   ░░░░░░░░░░░░   0%  resets in 6d04h
+  …                                                                      │ ── ACCOUNT ─── … ── ACTIONS ─── …
 
-The management screens use the same restrained cyan, purple, gray, and
-health-status palette as the regular dashboard. `--no-color` keeps the same
-spacing, hierarchy, selection marker, and content without ANSI escapes. The
-selected seat is shown with a high-contrast row highlight in color terminals.
-At 84 columns and wider, the main screen places the registered-seat table beside
-the selected-seat details. Narrower terminals stack the table above the detail
-pane. The detail pane groups information under **Account**, **Plan**, **Usage**,
-and **Credits** so current usage is easy to locate; Page Up/Down scrolls every
-detail line while the selected seat remains visible. The supported 24×6 minimum
-uses the same stacked structure in a deliberately compact form.
+↑↓ select  Enter open  c r e o p l seat actions  a add  / filter  Tab screens  g settings  ? help  Esc overview
+```
 
-- Overview: `m` manage, `?` help, `q` quit.
-- Global settings: press `g` from the overview, inventory, or Codex seat list,
-  or select the **Global settings** inventory row. This screen is separate from
-  per-seat settings and works even with no Codex seats registered.
-  Choose a preference, inspect the complete before and after settings, and confirm with
-  Enter/`y` or cancel with Escape/`n`. A changed settings revision requires a
-  new preview. The manager reloads its settings and refresher after a commit.
-- Management opens a unified inventory of seats only: every Codex seat, the
-  one Claude account, and every local seat. Local hosts are placement for local
-  seats, not seats, so they are not rows on this board (with one registered
-  host and one local seat, the inventory shows one local row). Enter opens the
-  selected item's controls; `h` toggles retired history. Arrows or `j`/`k`
-  select a row, and Escape from the inventory returns to the overview.
-- The inventory has exactly one **Add seat** row. Enter on it, or `a`, opens a
-  type menu: **Codex** opens the existing Add seat form; **Claude** opens the
-  existing single account's setup (mode, tier, headroom) because the Claude
-  backend is one account and no second login is created; **Local** opens the
-  local seat form on a registered host, or, when no host is registered yet, a
-  short menu to add a host first or open Local Hosts. Escape from the host
-  menu returns to seat types, and Escape from seat types returns to the
-  inventory. Escape from a form cancels it and, when the
-  form was opened from the inventory, returns there.
-- Controls opened from the inventory return to it: Escape from a Codex seat's
-  actions, a local seat's actions, or the Claude account actions lands back on
-  the inventory with every provider row and the prior selection, not on a
-  single-provider list. The footer shows `Esc inventory` on those menus.
-- Tab and Shift-Tab cycle through the inventory, Codex seats, Local Hosts,
-  Local Seats, and Claude account. Each list remembers its stable selection,
-  and lists entered by Tab keep their regular behaviour: Escape returns to the
-  overview. Local Hosts is also reachable from a selected local seat's
-  **Manage this seat's host** action, and the seat's detail names its host
-  under **Placement**. The provider screens retain their existing controls; see
-  [Local hosts and seats](#local-hosts-and-seats) for the local workflow.
-- Short list, action, and settings panes track the selected item. Page Up/Down
-  pages selected-seat detail and jumps through action/settings menus. Resize-only
-  screens ignore hidden action and confirmation keys until the terminal is at
-  least 24 columns by 6 rows (`q`, EOF, and signals still exit).
-- Forms: select a supported field, edit its value, then press Enter for the exact
-  before/after preview. Confirm with Enter or `y`; cancel with Escape or `n`.
-  Capacity opens a friendly plan-preset list first. `Advanced / custom values`
-  retains the three-part profile-slug, multiplier, and source form. In that
-  advanced form, printable `j`, `k`, and `q` are text; use the arrow keys to
-  change fields.
-- Actions, settings, presets, forms, confirmation, help, and result screens use
-  consistent headers, dividers, selection treatment, and key footers. Complete
-  mutation previews—including warnings and unified-diff lines—are wrapped and
-  paged with arrows or page keys. The footer always reports the displayed range
-  and keeps confirm/cancel discoverable.
+- **Summary strip.** The first line uses the dashboard's own header
+  (`● LIVE` / `↻ REFRESHING` / `○ CACHED`, local time and "updated 12s ago"),
+  followed by Ready (seats that can take work now / enabled seats), Running,
+  Queued, Waiting (when work waits for capacity), **Next →** the seat
+  `pick-seat` would choose for a small task, and the banked Resets. It is the
+  same read-only model `codex-seat capacity` gives agents
+  (`pool_view.collect`), so people and agents see the same numbers. On narrow
+  terminals the strip takes two lines and drops the least important counts.
+- **Screen line.** The five screens, the current one marked `▸`. Tab and
+  Shift-Tab move between them.
+- **Seat table.** One table for Codex, Claude and local seats under group
+  headers (`CODEX 5 · primary seat1 is used last`, `CLAUDE 1 · Opportunistic`,
+  `LOCAL 1 · global Opportunistic`). Columns are the role badge (`P` primary,
+  `W` worker, `C` Claude, `L` local), the seat with its plan, 5-hour and 7-day
+  remaining usage bars, the binding window's reset and a status chip. Bars are
+  green at 50% or more, amber from 20% to 49%, red below 20%, and gray when the
+  reading is stale or missing. Status chips use one vocabulary: `●` working
+  (the chip names the task), `○` idle or ready, `◐` stale, capped or draining,
+  `×` error or needs sign-in, `–` paused or off. Local seats show the model and
+  host instead of bars. The table ends with `+ Add seat   a`. Retired seats are
+  hidden until `h`.
+- **Detail pane.** At 110 columns and wider it sits to the right of the table;
+  narrower terminals stack it below, starting with a compact block (status,
+  usage and the direct keys) and continuing on PgDn. A Codex seat's detail
+  shows a header (seat · role · plan), its status in words, **Usage** (each
+  window's bar and "resets in …", banked resets), **Account** (email,
+  "✓ verified 3m ago", configured plan and the provider-observed plan),
+  **Actions** and **Details** (what it fits and, in one plain sentence, why
+  not — "7-day window has 0% left; small tasks need 10%", "Usage data is 4.3h
+  old", "Signed out" — then capacity, credits, account ID and refresh state;
+  `d` adds the raw capacity diagnostic, which `dash --forensic` also shows). Every action is listed with its key; one that
+  cannot run is dimmed and says why, for example
+  `p Pause  make another seat primary first`. Claude and local seats get the
+  same treatment.
+- **Ongoing work.** At 110 columns and wider, running work is listed under the
+  table when there is room.
+- **Footer.** The footer is generated from the keymap below and keeps the most
+  important keys when space runs out. After an action, a one-line result
+  replaces it until the next key (`✓ Paused seat4  ·  new work skips it  ·  p
+  resumes`); errors are a red line with the reason.
 
-The ordinary list includes active, draining, and inactive identities; retired
-identities are available in the explicit `h` history/all view. It shows lifecycle, role,
-cached authentication health, provider-reported usage/freshness, configured
-capacity, current work, and the selected seat's provider-reported account email
-and plan type. Provider workspace name/ID fields are unsupported and are not
-parsed, cached, or displayed. A backend account ID remains labeled `Account ID`;
-it is not presented as a workspace ID. Terminal control characters in identity
-fields, labels, and messages are neutralized, and wide/combining Unicode is
-measured in display cells.
+`--no-color` (or `NO_COLOR`) keeps exactly the same layout: the selected row
+keeps its `▌` marker and the current screen its `▸`, so the coloured frame with
+its escapes stripped is identical to the plain frame. Colour is an explicit flag
+from the command line, never guessed from the dashboard output. Untrusted text
+(labels, emails, provider messages) is sanitized, and wide or combining Unicode
+is measured in display cells. Below 60 columns each seat takes two lines (name
+and status, then the bars). The supported minimum is 24×6; smaller terminals
+show a resize message and only `q`, EOF and signals act.
 
-Identity is a small, manager-only cached view populated by the provider-owned
-`account/read` response during the existing account usage refresh. It is not
-added to the generic status, seat-list/show, or doctor JSON reports. The manager
-compares metadata (never contents) for the seat's `auth.json` with the version
-seen during refresh. After login changes, it suppresses the prior email and IDs
-until a refresh verifies the new account. The observed `planType` uses those same
-freshness and authentication-change protections. A transient metadata failure
-with an unchanged login labels the last verified identity stale; missing provider
-fields are shown as unavailable rather than guessed.
+## Keys
 
-## Configured plans and observed usage
+The keymap is declared once per screen in `seat_manager_tui.KEYMAP`; the footer,
+the `?` help and this table are generated from it.
 
-Claude has a separate account entry in management. Its editable settings are
-the provider mode, the small and big task minimum headroom percentages, and a
-subscription tier label. The dashboard shows the configured tier beside Claude,
-or an unknown-tier marker until it is set. The label is display metadata and
-does not change routing or quota limits. The current Claude Code status-line
-data documents usage percentages
-and reset times, but no Max 5x/20x plan field, so the manager marks a manually
-entered tier as **configured** and shows **unknown** until one is entered. See
-[Claude's status-line field reference](https://code.claude.com/docs/en/statusline#available-data).
-The Claude account actions also toggle active `/usage` refresh. It defaults on
-when Claude is enabled; an off Claude mode launches no probe. The sidecar uses
-the shared refresh lock and leaves passive statusline observations intact when
-tmux is unavailable or an active refresh fails.
+<!-- keymap:start -->
+| Where | Key | What it does |
+| --- | --- | --- |
+| Everywhere | `Esc` | Go back one step |
+| Everywhere | `Tab` | Next screen |
+| Everywhere | `Shift-Tab` | Previous screen |
+| Everywhere | `/` | Filter rows by seat or label |
+| Everywhere | `g` | Global settings |
+| Everywhere | `R` | Refresh every seat |
+| Everywhere | `?` | Help for this screen |
+| Everywhere | `q` | Quit |
+| Overview | `m` | Open the seat manager |
+| Overview | `R` | Refresh every seat |
+| Overview | `g` | Global settings |
+| Overview | `?` | Show help |
+| Overview | `q` | Quit |
+| Inventory | `↑↓ j k` | Select a row |
+| Inventory | `Enter` | Open the row's actions |
+| Inventory | `c` | Redeem a banked reset |
+| Inventory | `r` | Refresh usage for this seat |
+| Inventory | `e` | Edit plan and headroom |
+| Inventory | `o` | Make primary (used last) |
+| Inventory | `p` | Pause or resume |
+| Inventory | `l` | Sign in again |
+| Inventory | `a` | Add a seat of any kind |
+| Inventory | `h` | Show or hide retired seats |
+| Inventory | `d` | Show raw capacity diagnostic |
+| Inventory | `PgUp PgDn` | Scroll the detail |
+| Codex seats | `↑↓ j k` | Select a row |
+| Codex seats | `Enter` | Open the row's actions |
+| Codex seats | `c` | Redeem a banked reset |
+| Codex seats | `r` | Refresh usage for this seat |
+| Codex seats | `e` | Edit plan and headroom |
+| Codex seats | `o` | Make primary (used last) |
+| Codex seats | `p` | Pause or resume |
+| Codex seats | `l` | Sign in again |
+| Codex seats | `a` | Add a Codex seat |
+| Codex seats | `h` | Show or hide retired seats |
+| Codex seats | `d` | Show raw capacity diagnostic |
+| Codex seats | `PgUp PgDn` | Scroll the detail |
+| Local hosts | `↑↓ j k` | Select a row |
+| Local hosts | `Enter` | Open the row's actions |
+| Local hosts | `r` | Probe the host now (on the refresher) |
+| Local hosts | `e` | Edit the host's settings |
+| Local hosts | `p` | Pause or resume the host |
+| Local hosts | `L` | Set the global local mode |
+| Local hosts | `a` | Add a local host |
+| Local hosts | `h` | Show or hide retired hosts |
+| Local hosts | `PgUp PgDn` | Scroll the detail |
+| Local seats | `↑↓ j k` | Select a row |
+| Local seats | `Enter` | Open the row's actions |
+| Local seats | `r` | Probe this seat's host now |
+| Local seats | `e` | Edit the seat's settings |
+| Local seats | `p` | Pause or resume the seat |
+| Local seats | `a` | Add a local seat |
+| Local seats | `h` | Show or hide retired seats |
+| Local seats | `PgUp PgDn` | Scroll the detail |
+| Claude | `↑↓ j k` | Select a row |
+| Claude | `Enter` | Change the selected setting |
+| Claude | `PgUp PgDn` | Scroll the detail |
+| Global settings | `↑↓ j k` | Select a row |
+| Global settings | `Enter` | Change the selected setting |
+<!-- keymap:end -->
 
-Selected Codex seats show provider-reported banked reset count, credit details,
-grant/expiry dates and freshness separately from quota windows and workspace
-billing credits. **Redeem one banked reset** reads a fresh credit and account
-identity in the background, shows an exact confirmation preview, and rechecks
-the target before one provider consume attempt. Canceled previews spend nothing.
-An uncertain consume outcome is recorded without automatic retry. The
-`codex-seat redeem-reset seatN --preview` command offers the same read-only
-preview; an interactive human confirmation or current-request controller
-authority is required to redeem.
+- The direct keys act on the selected row. On the Inventory, `r`, `e` and `p`
+  on a local seat probe its host, edit it and pause or resume it, exactly as on
+  Local seats; `Enter` or `e` on the Claude row opens the Claude screen. A key
+  that does not apply to the row says why on the result line.
+- `Enter` opens the selected item's actions menu: the direct actions again
+  (with their keys, so they also work inside the menu) plus the rarer ones —
+  Remove seat, Pause now for a draining seat, Cancel this session's drain wait,
+  and for local seats Set seat mode, Set lifecycle and Manage this seat's host.
+- **Esc walks a back stack.** Help, menus, forms and choices return to exactly
+  where they were opened from; Esc on a screen opened from the Inventory (for
+  example a local seat's actions) returns to the Inventory with its selection.
+  Esc on a top-level screen returns to the dashboard overview, and `m` from the
+  overview always lands on the Inventory. Tab starts a fresh stack.
+- `/` filters the rows by seat id, label, plan, model or host as you type;
+  Enter keeps the filter, Esc clears it.
+- In text fields every printable key, including `q`, `j`, `k` and `?`, is
+  typed. Use the arrow keys to move between the advanced capacity fields.
+- `?` shows help for the screen you are on — the keys for **this screen** and
+  the keys that work **everywhere** — and returns there on Esc or `?`.
 
-The existing Claude provider is one account; its account entry does not create an
-independent second Claude login.
+## What applies at once, and what asks first
 
-Local seat removal is available after the seat is inactive and off and has no
-running job or held runtime slot. It retires the entry in place, keeping its
-history and host configuration. The local seat list still supports adding seats
-to registered hosts.
+Reversible changes apply on the keypress or form submit and report one result
+line: pause and resume, drain, refresh, role, plan and headroom edits, adding a
+seat, Claude settings, local host and seat changes, and global settings. Under
+the hood each is the manager's digest-pinned preview immediately followed by
+its commit, so a settings file that changed underneath still fails closed with
+nothing written and an error line.
 
-The manager deliberately shows three different facts:
+Only the two **irreversible** actions open a confirmation dialog:
 
-- **Configured plan/capacity** is the operator-selected routing baseline stored
-  in settings. It affects baseline-unit comparisons and scheduler admission.
-- **Observed account plan** is the literal `planType` returned by
-  `account/read`. **Observed usage plan** is the literal optional `planType`
-  returned with the rate-limit snapshot. Neither observation edits settings or
-  selects a Pro tier or Business subtype.
-- **Actual usage** is the provider-reported primary/secondary window data: each
-  available window's duration, remaining percentage, and reset time. Missing
-  windows, reset metadata, plan types, and credit metadata are shown as
-  unavailable—never as defaults or an invented “unlimited.” When supplied, the
-  literal workspace-credit balance/availability is displayed. “Unlimited” is
-  shown only when the provider explicitly reports it.
+- **Redeem a banked reset** (`c`): the fresh credit and account are read in the
+  background first ("Working… Esc cancels"); then the dialog says which seat
+  and account, what changes (usage windows reset, banked resets 2 → 1) and
+  warns that it spends a provider credit. Canceled previews spend nothing; the
+  login, registry and credit are checked again before the single consume
+  attempt, and an uncertain outcome is recorded without a retry.
+- **Remove a seat** (Codex or local, from the Enter menu): the dialog lists the
+  lifecycle change (Paused → Retired) and what is kept (home, sign-in,
+  history).
 
-Selectable configured presets are:
+Both dialogs take `Enter` to confirm, `Esc` to cancel and `d` to show the raw
+settings diff (the exact before/after, headers muted). If settings changed after
+the preview, Enter writes nothing, the dialog says so, and the next Enter shows
+a fresh preview.
 
-- Free and Go: capacity remains unverified (`null` multiplier).
-- Plus 1x: 1x baseline.
-- Pro 5x: 5x baseline.
-- Pro 20x: 20x baseline.
-- Standard 1x: 1x baseline.
-- Premium 5x: 5x estimate, stored under the compatible
-  `business-premium` slug.
+Resuming a paused Codex seat runs its sign-in and a fresh usage probe off the
+key loop before committing; a "Working" dialog shows progress and Esc cancels,
+leaving the seat paused. Pausing a busy seat drains it: new work skips it at
+once and this session pauses it when its task ends. Quitting with a drain still
+waiting asks first and leaves the seat draining; it is never completed
+unattended.
 
-Broad provider values such as `pro` or `business`, and the shape of observed
-quota windows, are not enough to infer a Pro 5x/20x tier or a Business subtype.
-Use the preset that matches verified billing, or keep the profile unverified/use
-the advanced custom controls. Custom profile slugs remain supported; capacity
-for an unknown profile is treated conservatively as unverified 1x.
-The baseline choices follow OpenAI's official
-[pricing guidance](https://learn.chatgpt.com/docs/pricing); the provider fields
-and rate-limit window semantics follow the official
-[app-server documentation](https://learn.chatgpt.com/docs/app-server).
+## Roles: primary and worker
 
-## Actions
+Codex seats are either the **primary** (`P`) or a **worker** (`W`). Routing
+spends every fitting worker first and uses the primary only when no worker
+fits, so the group header says "primary seat1 is used last". `o` makes the
+selected active worker the primary. The primary cannot be paused, drained or
+removed until another seat is made primary; the detail pane and the result line
+name that blocker. There is no deputy role.
 
-Selected refresh requests one Codex identity, including an inactive seat. It is
-coalesced through the same `.watch-refresh.lock` as periodic refreshes, reloads
-current settings only after acquiring the lock, and retains last-good figures on
-failure. The account metadata read shares
-the already initialized Codex app-server process and uses `refreshToken: false`;
-it does not open credentials. With `--no-active-probe`, the watcher runs in
-request-only mode: no periodic provider probe is started, while a manual request
-is still serviced.
+## Codex seats
 
-Pause first previews the exact lifecycle transaction. An idle seat becomes
-inactive after confirmation. A busy seat becomes draining immediately, stopping
-new admission without killing its current job. Only drains confirmed in this UI
-session are watched for idle completion. Canceling the wait or confirming quit
-leaves the seat draining; it is not completed unattended. Primary/deputy routing
-blockers shown by the guarded transaction must be resolved and re-previewed.
+- **Add** (`a`, or Add seat → Codex) takes a label, an optional absolute home
+  and a plan. The new seat is allocated transactionally (ids increase, retired
+  ids are never reused), starts paused, and is selected; sign it in with `l`
+  and resume it with `p` (as primary when it is the only active seat).
+- **Edit plan & headroom** (`e`) edits the label, reserve percentage, small and
+  big task headroom floors, and the configured plan. Each saved field applies
+  at once and the form stays open. The plan opens a preset list; `Advanced /
+  custom values` keeps the three-part profile slug, relative capacity
+  (`0.1`–`1000` or `null`) and source editor.
+- **Sign in again** (`l`) hands the terminal to the guarded `codex login`
+  contract: the dashboard stops and joins provider work, restores the real
+  screen, revalidates the seat's settings digest and home, runs the login, then
+  reloads settings and starts a new refresher. A change during quiescence, or a
+  refresher that does not stop within the bound, refuses the login.
+- **Refresh** (`r`) queues one coalesced usage refresh for the seat through the
+  shared refresh lock; last-good figures stay visible. `R` asks for a full
+  refresh of every seat, also with `--no-active-probe`.
+- **Remove** retires a paused, idle, non-primary seat. Its home, credentials
+  and history are kept; `h` shows retired seats.
 
-Add seat is available directly from the Codex seat list, including an empty
-registry, and from the inventory's Add seat type menu by choosing Codex. Its
-labeled form accepts a display label, an optional absolute home,
-and a plan preset, then shows the complete exact diff before confirm/cancel. It
-uses the transactional dynamic allocator: IDs increase beyond `seat5`, retired
-IDs are never reused, and a settings or allocation change after preview fails
-closed and requires a new preview. A newly added seat is selected in its inactive
-state, with next steps to configure capacity, sign in, and reactivate (as primary
-when it is the first active seat).
+The detail keeps three facts apart:
 
-Remove seat uses retirement semantics and the same exact digest-pinned preview.
-It is accepted only for a seat that is already inactive, has no live worker
-claim, and is neither primary nor deputy. Errors name the prerequisite to resolve
-before re-previewing. Removal does not delete or revoke the seat home or
-credentials and does not erase machine history or historical attribution; the
-retired identity remains available in the explicit history/all view.
+- **Configured plan** is the operator-selected baseline in settings (Free, Go,
+  Plus 1x, Pro 5x, Pro 20x, Standard 1x, Premium 5x estimate, or unverified).
+  It drives baseline-unit comparisons and admission.
+- **Observed plan** is the provider's `planType` from `account/read` (and, under
+  Details, the optional plan type returned with the usage snapshot). Neither is
+  used to infer a Pro 5x/20x tier or a Business subtype.
+- **Usage** is the provider-reported window data: each window's remaining
+  percentage and reset time. Missing windows, plans and credits are shown as
+  unavailable, never as defaults; "unlimited" appears only when the provider
+  reports it.
 
-Reactivate first previews the exact stable target and role semantics. After
-confirmation, login status and a fresh authoritative usage probe run off the key
-loop under the shared refresh lock. Any settings/home/role/lifecycle change from
-the original preview makes the checks or commit fail closed, leaving the seat
-inactive.
+Identity is a small manager-only cached view refreshed with the account usage
+read. After a login change the previous email and IDs are suppressed until a
+refresh verifies the new account, and a transient read failure marks the last
+verified identity stale.
 
-Sign in again is separately confirmed for the stable seat. The dashboard cancels
-and joins provider work, restores termios and the real screen, keeps its registered
-settings-reader heartbeat alive, then revalidates the exact confirmed settings
-digest and resolved home before calling the existing guarded `codex login`
-contract with the confirmed settings snapshot. A change during quiescence refuses
-login and requires a new confirmation. On return it reloads settings, publishes
-fresh reader topology metadata, and creates a new watcher; if the old watcher
-cannot quiesce within the shutdown bound, login is refused.
+## Claude
 
-Supported forms are label, role, reserve percentage, small/big task headroom
-floors, and configured capacity. Capacity provides the presets above plus an
-accessible advanced profile slug, relative capacity (`0.1` through `1000`, or
-`null`), and source editor. Existing core validation is authoritative. Broader
-pool settings are read-only. Billing or membership, credential revocation, and
-destructive home removal are intentionally absent.
+The Claude screen lists the account's settings as rows — Mode, Subscription
+tier, Small-task floor, Big-task floor and Active `/usage` refresh — with the
+account detail beside them (status, usage windows, settings and provider
+details). Enter on a row changes it at once. The tier is a display label only
+and does not change routing or quota limits; the status-line data has no plan
+field, so a typed tier is shown as configured. Claude is one account: Add seat →
+Claude opens these settings rather than a second login. No provider client runs
+and no credentials are read; the usage cache is not read while Claude is off.
 
-Global settings offer typed choices for `review.mode` (`off`, `advisory`,
-`blocking`), `review.strategy` (`single`, `cross`),
-`execution.delegation_policy` (`auto`, `always`, `manual`),
-and `execution.head_permissions` (`safe`, `full-access`). They also offer a
-boolean choice for `execution.head_worker_fallback` (true by default), and a
-1–240 minute integer input for `execution.inline_max_minutes`. The same settings
-screen also offers `ui.theme` (system/light/dark), `ui.density`
-(comfortable/compact), and `ui.accent` (teal/indigo). All six orchestration and
-three appearance preferences live in the existing `settings.json`; unknown
-settings and metadata are retained.
-`codex-seat probe` uses the structured account usage read under the shared
-watcher refresh lock; it never drives a terminal UI.
+## Global settings
 
-`review.mode` (shown as Goal review mode) governs automatic goal supervision
-only. `delegate`, `await`, and ChangeSet apply review only when a review is
-explicitly requested with `codex-seat review`; `review.strategy` is also that
-command's default strategy. Every preference is optional, review mode defaults
-to off, and no review is mandatory.
+`g` opens the six optional preferences from anywhere in the manager; they apply
+at once.
+
+| Label | Setting | Values |
+| --- | --- | --- |
+| Goal review mode | `review.mode` | Off (default), Advisory, Blocking |
+| Review strategy | `review.strategy` | Single reviewer, Cross-provider |
+| Delegation | `execution.delegation_policy` | Automatic, Always delegate, Manual |
+| Inline minutes | `execution.inline_max_minutes` | 1–240 |
+| Head mode | `execution.head_permissions` | Safe, Full access |
+| Head fallback | `execution.head_worker_fallback` | Enabled (default), Disabled |
+
+Goal review mode governs automatic goal supervision only; `delegate`, `await`
+and ChangeSet apply review only when a review is explicitly requested with
+`codex-seat review`, whose default strategy is the review strategy. Unknown
+settings and metadata in `settings.json` are retained; a legacy `ui` section is
+kept as-is and ignored.
 
 ## Local hosts and seats
 
-The Local Hosts and Local Seats screens manage the additive `local_hosts` and
-`local_seats` registries described in [local seats](local-seats.md) without
-leaving the dashboard. They read through `SeatManager.local_manager()`, whose
-report uses cached availability and the live probe snapshot only; opening a
-screen never probes, writes, or touches the local runtime cache. Both screens
-stay fully manageable when no Codex seat is registered.
+The Local hosts and Local seats screens manage the `local_hosts` and
+`local_seats` registries described in [local seats](local-seats.md). They read
+the cached availability and the live probe snapshot only: opening a screen
+never probes, writes or touches the local runtime cache, and both work with no
+Codex seats registered.
 
-The host list shows ID, lifecycle, cached availability state, and label. The
-selected-host detail groups the global mode; base and lease URLs and the probe
-argv/timeout; resource groups with their maximum concurrency and attached seats;
-the cached availability state, detail, reason, served model, and observation
-age; and the live probe state (probing now, queued, last result with its source
-and finish age, periodic on/off, and the last worker error). The seat list shows
-ID, lifecycle, effective mode, and label; its detail groups global, seat, and
-effective modes; host, resource group maximum, and concurrency; model profile,
-harness, task shapes, validation, and runtime fingerprint; cached eligibility
-with its machine-readable reason and observation age; and the host's live probe
-state. Global `off`, stale or missing cache entries, and non-active lifecycles
-are named explicitly (`mode_off`, `availability_stale`, `lifecycle_ineligible`,
-and so on) rather than hidden. Values are sanitized and paged exactly like the
-frontier detail; the 24×6 minimum uses the same stacked layout.
+- A host's detail shows its label and the global mode, the endpoint (base and
+  lease URLs, probe argv and timeout), capacity (resource groups and attached
+  seats), the cached **availability** (status, the routing reason in words with
+  its machine name, the observation age) and the **live probe** (probing now,
+  queued, the last result with its source and age, periodic on or off, the last
+  worker error).
+- A local seat's detail shows its effective, global and seat modes and
+  lifecycle; placement (host, resource group and its maximum, slots); the model
+  (profile, context, harness, task shapes, checks, runtime fingerprint); its
+  cached availability with eligibility; and the host's live probe. Global off,
+  stale or missing observations and non-active lifecycles are named explicitly
+  instead of being shown as failures.
+- `r` queues one read-only probe on the refresher's local probe worker and
+  returns at once (also with `--no-active-probe`); the detail follows the probe
+  as it runs. `p` pauses or resumes; pausing a local seat also sets its mode
+  off, and a resumed seat keeps mode off until you set it. `L` sets the global
+  local mode from the Local hosts screen. `e` opens the edit form; `a` adds a
+  host or a seat.
+- The Enter menu adds Set lifecycle (only transitions the registry allows;
+  retired is terminal), Set seat mode, Add local seat on this host, Manage this
+  seat's host, and Remove seat. Removal needs the seat inactive with mode off
+  and no running local job; it is confirmed in a dialog and keeps the entry as
+  retired history.
+- Add and Edit are field forms. Host fields are the immutable id, label,
+  lifecycle, optional `base_url` and `lease_url` (blank removes them),
+  `resource_groups` as JSON and an optional `availability_probe` as JSON. Seat
+  fields are the immutable id, label, lifecycle, mode, host and resource group
+  (chosen from the registered hosts), model profile, context window, harness,
+  maximum concurrency, `capabilities` as JSON and the `sha256:` runtime
+  fingerprint. Edit forms exclude lifecycle and mode (use their actions) and
+  send only the fields that changed. Validation errors are shown on the result
+  line with the form kept for correction.
 
-Keys on both local screens: `a` opens Add host or Add seat (also from an empty
-registry), `g` opens the global local mode, arrows or `j`/`k` select a stable
-ID, Enter opens actions, Page Up/Down scrolls detail, Tab switches screens, and
-Escape returns to the overview. `p` on the host screen queues Probe now.
+Every local change goes through `LocalSeatManager.preview_*` and commits with
+the explicit current-request marker on the same keypress; a settings change in
+between fails with nothing written.
 
-Actions: a host offers Probe now, Set host lifecycle, Edit host configuration,
-Add local seat on this host, and Set global local mode. A seat offers Set seat
-mode, Set seat lifecycle, Edit seat configuration, Probe this seat's host now,
-Manage this seat's host (opens that host's actions on Local Hosts), Remove
-seat, and Set global local mode. Remove requires inactive lifecycle,
-off mode, and no active local work; it retains a retired entry. Mode and
-lifecycle choices are short lists marked
-with the current value; lifecycle lists contain only transitions the registry
-allows (retired is terminal) and the transaction rejects invalid combinations,
-such as deactivating a host that still has active seats, with the core error.
+## Terminal and authority boundary
 
-Add and Edit are field-oriented forms. Host fields are the immutable id, label,
-lifecycle, optional `base_url` and `lease_url` (blank removes an optional field),
-`resource_groups` as validated JSON, and optional `availability_probe` as
-validated JSON. Seat fields are the immutable id, label, lifecycle, mode, host
-and resource group chosen from the registered hosts and their groups, model
-profile, harness, maximum concurrency, `capabilities` as validated JSON, and the
-`sha256:` runtime fingerprint. Every field can be typed or pasted in the TUI;
-edit forms carry the current values, exclude lifecycle and mode (use their
-actions), and send only the fields that changed. Malformed JSON, non-integer
-numbers, invalid URLs or fingerprints, unknown hosts, concurrency above the
-group maximum, and every other core validation error are shown verbatim with
-the form kept intact for correction.
+The interactive manager needs a real TTY on both stdin and stdout. An explicit
+`--manage` fails in captured output and in managed workers, even on a
+pseudo-terminal; managed workers are refused every mutation and probe in the
+manager. A human in a head pane with a real terminal may open it with
+`dash --manage`, and so may an agent driving a head pane with a real terminal;
+`dash --watch` inside a head's command pane stays captured and read-only.
 
-Every local mutation goes through `LocalSeatManager.preview_*` and the same
-CONFIRM CHANGE screen as frontier actions: it shows the action, target, backend
-warnings, an explicit note when the write makes local execution less
-restrictive, and the exact unified diff of the canonical settings document.
-Escape or `n` discards the preview; Enter or `y` commits with the explicit
-current-request marker, which is passed only from that confirmation. Previews
-are pinned to the settings digest, so any change between preview and confirm
-reports a stale-preview error and writes nothing. Commits are refused, with the
-core refusal shown, in controller/head and managed-worker contexts even through
-a pseudo-terminal, and without a real stdin/stdout terminal.
+Agents usually prefer the command line, which offers the same light management
+from any head or plain shell: `codex-seat capacity --json` for the model behind
+the summary strip, `codex-seat seats pause|resume|refresh|set|set-role`,
+`codex-seat provider claude set` and `codex-seat config policy set --apply` (see
+the [agent guide](agents.md)). Seat login, retire/remove and redeeming a banked
+reset keep their human-terminal rules.
 
-Probe now queues one coalesced read-only probe through the watch refresher's
-local probe worker and returns immediately; nothing runs on the key loop. With
-`--no-active-probe`, periodic local probing is off but Probe now is still
-serviced. The detail pane reports queued/probing/finished state as the
-refresher's snapshot changes and reads the cached result afterwards.
-
-EOF, Ctrl-C, `q`, SIGTERM, and SIGHUP all unwind the same terminal ownership
-context. Termios, signal handlers, and the alternate screen are restored in
-`finally`; background cancellation and joins are bounded.
-
-If provider work does not quiesce before the shutdown bound, the dashboard
-reports failure and does not replace the refresher or proceed to login.
+EOF, Ctrl-C, `q`, SIGTERM and SIGHUP all unwind the same terminal ownership:
+termios, signal handlers and the alternate screen are restored in `finally`, and
+background cancellation and joins are bounded.

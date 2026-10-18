@@ -462,6 +462,7 @@ class WatchRefresher:
         self._selected_last_succeeded: bool | None = None
         self._selected_last_finished_at: float | None = None
         self._selected_generation = 0
+        self._full_pending = False
         # Bounded, cancelable shared-lock contention retry for a selected
         # refresh. The intent is retained across exhaustion for a later cycle.
         self._selected_lock_attempts = 3
@@ -809,6 +810,17 @@ class WatchRefresher:
                 generation=self._selected_generation,
             )
 
+    def request_full_refresh(self) -> None:
+        """Ask for one full refresh attempt as soon as the worker is free.
+
+        Works with ``periodic`` off too; an attempt already running satisfies it.
+        """
+        with self._state_lock:
+            if self._closed or self.cancel_event.is_set():
+                raise RuntimeError("refresh service is closed")
+            self._full_pending = True
+        self._wake.set()
+
     def run_forever(self) -> None:
         while not self.cancel_event.is_set():
             selected_result = self._take_and_run_selected()
@@ -817,6 +829,11 @@ class WatchRefresher:
                 # immediately spin through another retry batch.
                 if selected_result == "contended" and self.waiter(1.0):
                     break
+                continue
+            with self._state_lock:
+                full, self._full_pending = self._full_pending, False
+            if full:
+                self.run_attempt()
                 continue
             if not self.periodic:
                 if self.waiter(3600.0):

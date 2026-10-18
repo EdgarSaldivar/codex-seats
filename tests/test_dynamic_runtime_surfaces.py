@@ -34,9 +34,6 @@ def _settings(root: Path, seats: dict[str, str], *, primary: str | None = None) 
     active = [seat_id for seat_id, lifecycle in seats.items() if lifecycle == "active"]
     chosen_primary = primary if primary is not None else (active[0] if active else None)
     settings["pool"]["primary"] = chosen_primary
-    settings["pool"]["deputy"] = next(
-        (seat_id for seat_id in active if seat_id != chosen_primary), None
-    )
     (root / "settings.json").write_text(json.dumps(settings))
     with Ledger(root):
         pass
@@ -109,13 +106,13 @@ def test_lifecycle_views_hide_retired_and_do_not_count_inactive_as_capacity(tmp_
         "inactive": 1,
         "retired": 1,
     }
-    assert "Active (Unverified)" in rendered
-    assert "Draining (Unverified)" in rendered
-    assert "Inactive (Unverified)" not in rendered
+    assert "Active Unverified" in rendered
+    assert "Draining Unverified" in rendered
+    assert "Inactive Unverified" not in rendered
     assert "seat1" in resets and "seat2" in resets and "seat3" in resets
     for text in (rendered, resets):
         assert "seat10" not in text and "seat99" not in text
-    assert "draining" in resets and "inactive" in resets
+    assert "[draining]" in resets and "[paused]" in resets
     assert "seat2[draining]" in tmux
     assert "seat3" not in tmux and "seat10" not in tmux and "seat99" not in tmux
 
@@ -187,7 +184,6 @@ def test_dispatch_claim_join_reloads_registry_instead_of_using_stale_caller_sett
 
     current = json.loads(json.dumps(supplied))
     current["pool"]["seats"]["seat6"]["lifecycle"] = "inactive"
-    current["pool"]["deputy"] = None
     (tmp_path / "settings.json").write_text(json.dumps(current))
 
     assignments = dispatch_client._actual_assignments(tmp_path, supplied)

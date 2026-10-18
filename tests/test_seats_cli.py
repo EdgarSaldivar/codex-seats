@@ -94,7 +94,7 @@ def test_list_show_zero_one_two_retired_by_stable_id_or_number(
     assert json.loads(capsys.readouterr().out)["seats"] == []
 
     one = add_seat(tmp_path, label="Primary").seat_id
-    two = add_seat(tmp_path, label="Deputy").seat_id
+    two = add_seat(tmp_path, label="Worker").seat_id
     for seat_id in (one, two):
         (tmp_path / seat_id).mkdir(mode=0o700)
     activate_seat(
@@ -346,24 +346,14 @@ def test_mutations_apply_all_lifecycle_and_field_commands(
 
 
 @pytest.mark.parametrize(
-    ("environment", "message"),
-    [
-        ({"CODEX_SEATS_MANAGED_WORKER": "1"}, "managed workers"),
-        ({"CODEX_SEATS_HEAD": "claude"}, "controller/head"),
-        ({"CODEX_SEATS_HEAD": "codex"}, "controller/head"),
-        ({"CODEX_CONTROL_SEAT": "seat1"}, "controller/head"),
-        (
-            {"CODEX_THREAD_ID": "thread", "CODEX_HOME": "/controlled"},
-            "controller/head",
-        ),
-    ],
+    "environment",
+    [{"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}],
 )
-def test_every_write_refuses_worker_and_controller_contexts(
+def test_every_write_refuses_managed_workers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     environment: dict[str, str],
-    message: str,
 ) -> None:
     _clear_context(monkeypatch)
     _write_settings(tmp_path)
@@ -372,8 +362,36 @@ def test_every_write_refuses_worker_and_controller_contexts(
         monkeypatch.setenv(key, value)
     before = (tmp_path / "settings.json").read_bytes()
     assert cli.main(["seats", "add", "--label", "Nope"]) == 2
-    assert message in capsys.readouterr().err
+    assert "managed workers" in capsys.readouterr().err
     assert (tmp_path / "settings.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"CODEX_SEATS_HEAD": "claude"},
+        {"CODEX_SEATS_HEAD": "codex"},
+        {"CODEX_CONTROL_SEAT": "seat1"},
+        {"CODEX_THREAD_ID": "thread", "CODEX_HOME": "/controlled"},
+    ],
+)
+def test_heads_and_controllers_may_make_light_registry_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    environment: dict[str, str],
+) -> None:
+    _clear_context(monkeypatch)
+    _write_settings(tmp_path)
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    assert cli.main(["seats", "add", "--label", "Agent added", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is True and report["seat_id"] == "seat1"
+    # Retirement stays with a human outside head/controller contexts.
+    assert cli.main(["seats", "retire", "seat1", "--from-current-user-request"]) == 2
+    assert "controller/head" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

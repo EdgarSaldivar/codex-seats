@@ -20,9 +20,6 @@ def test_defaults_and_validation():
         "execution.inline_max_minutes": 5,
         "execution.head_permissions": "full-access",
         "execution.head_worker_fallback": True,
-        "ui.theme": "system",
-        "ui.density": "comfortable",
-        "ui.accent": "teal",
     }
     assert normalize_policy_value("execution.inline_max_minutes", "12") == 12
     assert normalize_policy_value("execution.head_worker_fallback", False) is False
@@ -35,9 +32,7 @@ def test_defaults_and_validation():
         ("execution.head_worker_fallback", "false"),
         ("pool.probe_mode", "structured"),
         ("execution.worker_access", "trusted-development"),
-        ("ui.theme", "purple"),
-        ("ui.density", True),
-        ("ui.accent", "blue"),
+        ("ui.theme", "dark"),
     ):
         with pytest.raises(PolicyError):
             normalize_policy_value(key, value)
@@ -88,9 +83,6 @@ def test_every_preference_previews_typed_value_without_losing_metadata(tmp_path)
         "execution.inline_max_minutes": "240",
         "execution.head_permissions": "safe",
         "execution.head_worker_fallback": False,
-        "ui.theme": "dark",
-        "ui.density": "compact",
-        "ui.accent": "indigo",
     }
     preview = preview_policy(tmp_path, values)
     updated = json.loads(preview.after)

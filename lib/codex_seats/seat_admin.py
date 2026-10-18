@@ -448,22 +448,18 @@ def _verify_activation_home(
 
 def _role_guard(pool: dict[str, Any], seat_id: str, *, allow_empty: bool) -> None:
     active = active_seat_ids({"schema": 3, "pool": pool})
-    designated = [role for role in ("primary", "deputy") if pool.get(role) == seat_id]
-    final_primary = active == [seat_id] and pool.get("primary") == seat_id
+    is_primary = pool.get("primary") == seat_id
+    final_primary = active == [seat_id] and is_primary
     if final_primary and not allow_empty:
         raise SeatAdminError(
             f"{seat_id} is the final active primary; explicit allow_empty is required"
         )
-    if designated and not (allow_empty and final_primary):
-        roles = " and ".join(designated)
-        raise SeatAdminError(
-            f"{seat_id} is the designated {roles}; assign or clear that role first"
-        )
+    if is_primary and not (allow_empty and final_primary):
+        raise SeatAdminError(f"{seat_id} is the primary; make another seat primary first")
     if allow_empty and not final_primary:
         raise SeatAdminError("allow_empty applies only to the final active primary")
     if final_primary:
         pool["primary"] = None
-        pool["deputy"] = None
 
 
 def _set_fields(
@@ -639,33 +635,23 @@ def _apply_action(
             _require_idle(ledger, seat_id)
     elif action == "set-role":
         role = options.get("role")
-        if role not in {"primary", "deputy", "worker"}:
-            raise SeatAdminError("role must be primary, deputy, or worker")
+        if role == "deputy":
+            raise SeatAdminError("deputy role was removed; seats are primary or worker")
+        if role not in {"primary", "worker"}:
+            raise SeatAdminError("role must be primary or worker")
         if entry.get("lifecycle") != "active":
             raise SeatAdminError("roles may be assigned only to active seats")
         if role == "primary":
             pool["primary"] = seat_id
-            if pool.get("deputy") == seat_id:
-                pool["deputy"] = None
-        elif role == "deputy":
-            if pool.get("primary") == seat_id:
-                raise SeatAdminError(
-                    "the primary cannot also be deputy; assign a replacement primary first"
-                )
-            pool["deputy"] = seat_id
         elif pool.get("primary") == seat_id:
             raise SeatAdminError(
                 "the current primary cannot become a worker while active seats remain; "
-                "assign its replacement instead"
+                "make another seat primary instead"
             )
-        elif pool.get("deputy") == seat_id:
-            pool["deputy"] = None
     elif action == "activate":
         if entry.get("lifecycle") == "active":
             if options.get("as_primary") and pool.get("primary") != seat_id:
                 pool["primary"] = seat_id
-                if pool.get("deputy") == seat_id:
-                    pool["deputy"] = None
             return seat_id, False, warnings
         if entry.get("lifecycle") not in {"inactive", "draining"}:
             raise SeatAdminError(
@@ -693,8 +679,6 @@ def _apply_action(
         entry["lifecycle"] = "active"
         if options.get("as_primary"):
             pool["primary"] = seat_id
-            if pool.get("deputy") == seat_id:
-                pool["deputy"] = None
         if entry.get("relative_capacity") is None:
             warnings.append(
                 f"{seat_id} has unverified capacity; routing will conservatively use 1x"
@@ -736,8 +720,8 @@ def _apply_action(
             return seat_id, False, warnings
         if entry.get("lifecycle") != "inactive":
             raise SeatAdminError("retirement requires an already inactive seat")
-        if pool.get("primary") == seat_id or pool.get("deputy") == seat_id:
-            raise SeatAdminError("retirement requires a non-primary, non-deputy seat")
+        if pool.get("primary") == seat_id:
+            raise SeatAdminError("retirement requires a non-primary seat; make another seat primary first")
         _require_idle(ledger, seat_id)
         entry["lifecycle"] = "retired"
         warnings.append(

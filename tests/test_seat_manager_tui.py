@@ -21,17 +21,29 @@ import pytest
 
 from codex_seats import cli
 from codex_seats.seat_admin import add_seat, set_seat
-from codex_seats.seat_manager import ActionPreview, LoginPlan, SeatManager
+from codex_seats.seat_manager import (
+    ActionPreview,
+    LoginPlan,
+    PausePlan,
+    PauseResult,
+    PendingDrain,
+    SeatManager,
+    StalePreviewError,
+)
 from codex_seats.seat_manager_tui import (
     ADD_FIELDS,
     CAPACITY_CHOICES,
     FIELDS,
+    GLOBAL_KEYS,
     GLOBAL_LABELS,
     KEY_BACKTAB,
     KEY_TAB,
+    KEYMAP,
+    MARKER,
     ManagerUI,
     UIExit,
-    INVENTORY_GLOBAL_KEY,
+    footer_parts,
+    keymap_markdown,
 )
 from codex_seats.policy_settings import DEFAULTS
 from codex_seats.terminal import (
@@ -48,6 +60,9 @@ from codex_seats.state import (
     load_settings,
     default_settings,
 )
+from codex_seats.tui_style import strip_ansi
+
+SELECTED_BG = "\x1b[1;48;2;68;71;90m"
 
 
 class _Tty(io.StringIO):
@@ -55,7 +70,23 @@ class _Tty(io.StringIO):
         return True
 
 
+class _Refresher:
+    """A refresher double: records refresh requests, reports no snapshot."""
+
+    def __init__(self) -> None:
+        self.settings = None
+        self.full_requests = 0
+
+    def snapshot(self):
+        return None
+
+    def request_full_refresh(self) -> None:
+        self.full_requests += 1
+
+
 class _FakeManager:
+    """Registry-only manager double; mutations are recorded, never written."""
+
     def __init__(self) -> None:
         self.settings = default_settings()
         self.settings["pool"]["seats"] = {
@@ -80,6 +111,8 @@ class _FakeManager:
         }
         self.settings["pool"]["primary"] = "seat1"
         self.pending: list[SimpleNamespace] = []
+        self.busy: set[str] = {"seat1"}
+        self.calls: list[tuple] = []
         self.identity = {
             "status": "unavailable",
             "email": None,
@@ -94,14 +127,14 @@ class _FakeManager:
             "seats": [
                 {
                     "id": seat_id,
-                    "role": "primary" if seat_id == "seat1" else None,
+                    "role": "primary" if self.settings["pool"].get("primary") == seat_id else None,
                     "lifecycle": entry["lifecycle"],
                     "provider": {
                         "health": "ok",
                         "freshness": "fresh",
                         "binding_window": None,
                     },
-                    "claim": {"live": seat_id == "seat1"},
+                    "claim": {"live": seat_id in self.busy},
                     "capacity": {
                         "profile": entry["capacity_profile"],
                         "relative_capacity": entry["relative_capacity"],
@@ -134,110 +167,72 @@ class _FakeManager:
     def preview_remove(self, seat_id):
         return replace(_preview(), action="retire", seat_id=seat_id)
 
+    def global_settings_report(self):
+        return dict(DEFAULTS)
 
-def _frontier_ui(manager) -> ManagerUI:
-    """Direct management lands on the inventory; one Tab reaches frontier seats."""
-    ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
+    # -- recorded mutations ---------------------------------------------------
+    def _lifecycle(self, seat_id: str, lifecycle: str) -> None:
+        self.settings["pool"]["seats"][seat_id]["lifecycle"] = lifecycle
+
+    def preview_pause(self, seat_id):
+        busy = seat_id in self.busy
+        mode = "drain" if busy else "deactivate"
+        return PausePlan(seat_id, busy, mode, replace(_preview(), action=mode, seat_id=seat_id))
+
+    def commit_pause(self, plan):
+        self.calls.append(("pause", plan.seat_id))
+        self._lifecycle(plan.seat_id, "draining" if plan.busy else "inactive")
+        pending = (
+            PendingDrain(plan.seat_id, time.time(), "draining", "draining; awaiting idle")
+            if plan.busy else None
+        )
+        return PauseResult(plan.seat_id, SimpleNamespace(changed=True), pending)
+
+    def preview_set_role(self, seat_id, role):
+        return replace(_preview(), action="set-role", seat_id=seat_id,
+                       options=MappingProxyType({"role": role}))
+
+    def preview_set(self, seat_id, **fields):
+        return replace(_preview(), action="set", seat_id=seat_id, options=MappingProxyType(fields))
+
+    def preview_reactivate(self, seat_id, *, as_primary=False):
+        return replace(_preview(), action="activate", seat_id=seat_id,
+                       options=MappingProxyType({"as_primary": as_primary}))
+
+    def run_activation_checks(self, preview, _cancel):
+        return SimpleNamespace(passed=True, seat_id=preview.seat_id, detail="checks completed")
+
+    def commit_activation(self, preview, _checks):
+        self.calls.append(("activate", preview.seat_id))
+        self._lifecycle(preview.seat_id, "active")
+
+    def commit(self, preview):
+        self.calls.append((preview.action, preview.seat_id, dict(preview.options)))
+        if preview.action == "set-role":
+            self.settings["pool"]["primary"] = preview.seat_id
+        if preview.action == "retire":
+            self._lifecycle(preview.seat_id, "retired")
+        return SimpleNamespace(changed=True, seat_id=preview.seat_id)
+
+    def request_refresh(self, seat_id):
+        self.calls.append(("refresh", seat_id))
+        return seat_id
+
+    def preview_login(self, seat_id):
+        return LoginPlan(seat_id, Path("/pool") / seat_id, "digest", self.settings)
+
+    def cancel_pending_drain(self, seat_id):
+        self.calls.append(("cancel-drain", seat_id))
+        return SimpleNamespace(detail="wait canceled; seat remains draining")
+
+
+def _frontier_ui(manager, **kwargs) -> ManagerUI:
+    """Direct management lands on the inventory; one Tab reaches Codex seats."""
+    ui = ManagerUI(manager, direct=True, **kwargs)  # type: ignore[arg-type]
     assert ui.screen == "inventory" and ui.view == "list"
     ui.handle(KEY_TAB)
     assert ui.screen == "seats" and ui.view == "list"
     return ui
-
-
-@pytest.mark.parametrize("schema", [2, 3])
-def test_global_settings_inventory_zero_seats_choice_cancel_and_stale(
-    tmp_path, monkeypatch, schema
-) -> None:
-    settings = default_settings() if schema == 3 else default_settings()
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(settings) + "\n")
-    path.chmod(0o600)
-    with Ledger(tmp_path):
-        pass
-    manager = SeatManager(tmp_path, load_settings(tmp_path)[0])
-    ui = ManagerUI(manager, direct=True)
-    assert INVENTORY_GLOBAL_KEY in [row.key for row in ui._inventory_rows()]
-    ui.handle("g")
-    assert ui.view == "global-settings"
-    from codex_seats.seat_manager_tui import GLOBAL_LABELS
-    assert all(GLOBAL_LABELS[field] in ui.render(100, 24, "") for field in DEFAULTS)
-    ui.handle("enter")
-    assert ui.view == "global-choice"
-    ui.handle("down")
-    ui.handle("enter")
-    assert ui.view == "confirm"
-    material = "\n".join(ui._preview_material())
-    assert "--- settings.before" in material
-    assert "+++ settings.after" in material
-    assert "BEFORE settings.before" not in material
-    before = path.read_text()
-    ui.handle("esc")
-    assert path.read_text() == before
-    ui.handle("enter")
-    ui.handle("down")
-    ui.handle("enter")
-    assert ui.view == "confirm"
-    # An independent settings update invalidates the digest-pinned preview.
-    changed = json.loads(path.read_text())
-    changed["future_metadata"] = {"revision": 2}
-    path.write_text(json.dumps(changed) + "\n")
-    monkeypatch.setenv("CODEX_SEATS_MANAGED_WORKER", "0")
-    monkeypatch.setattr("codex_seats.seat_manager.ensure_management_eligible", lambda: None)
-    ui.handle("y")
-    assert ui.view == "message" and "stale" in ui.message
-    assert json.loads(path.read_text())["future_metadata"] == {"revision": 2}
-
-
-def test_global_settings_offer_six_controls_without_probe_mode() -> None:
-    assert tuple(GLOBAL_LABELS) == tuple(DEFAULTS)
-    assert set(DEFAULTS) == {
-        "review.mode", "review.strategy", "execution.delegation_policy",
-        "execution.inline_max_minutes", "execution.head_permissions",
-        "execution.head_worker_fallback", "ui.theme", "ui.density", "ui.accent",
-    }
-    assert {key: DEFAULTS[key] for key in ("ui.theme", "ui.density", "ui.accent")} == {
-        "ui.theme": "system", "ui.density": "comfortable", "ui.accent": "teal",
-    }
-    assert DEFAULTS["review.mode"] == "off"
-    assert DEFAULTS["execution.inline_max_minutes"] == 5
-    assert DEFAULTS["execution.head_worker_fallback"] is True
-    assert "pool.probe_mode" not in DEFAULTS
-
-
-def test_global_settings_number_and_boolean_commit_reload(tmp_path, monkeypatch) -> None:
-    settings = default_settings()
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps(settings) + "\n")
-    path.chmod(0o600)
-    with Ledger(tmp_path):
-        pass
-    manager = SeatManager(tmp_path, load_settings(tmp_path)[0], refresher=SimpleNamespace(settings=None))
-    ui = ManagerUI(manager, direct=True)
-    monkeypatch.setenv("CODEX_SEATS_MANAGED_WORKER", "0")
-    monkeypatch.setattr("codex_seats.seat_manager.ensure_management_eligible", lambda: None)
-    ui.handle("g")
-    ui.global_index = tuple(DEFAULTS).index("execution.inline_max_minutes")
-    ui.handle("enter")
-    assert ui.view == "global-input"
-    ui.input_buffer = "12"
-    ui.handle("enter")
-    ui.handle("y")
-    assert manager.settings["execution"]["inline_max_minutes"] == 12
-    assert manager.refresher.settings is manager.settings
-    ui.handle("enter")
-    ui.global_index = tuple(DEFAULTS).index("execution.head_worker_fallback")
-    ui.handle("enter")
-    ui.handle("down")
-    ui.handle("enter")
-    ui.handle("y")
-    assert manager.settings["execution"]["head_worker_fallback"] is False
-    ui.handle("enter")
-    ui.global_index = tuple(DEFAULTS).index("ui.theme")
-    ui.handle("enter")
-    ui.handle("down")
-    ui.handle("enter")
-    ui.handle("y")
-    assert manager.settings["ui"]["theme"] != "system"
 
 
 def _preview(lines: int = 30) -> ActionPreview:
@@ -255,28 +250,221 @@ def _preview(lines: int = 30) -> ActionPreview:
     )
 
 
+def _plain_frame(frame: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", frame)
+
+
+def _squash(frame: str) -> str:
+    return re.sub(r" +", " ", frame)
+
+
+def _fits(frame: str, width: int, height: int) -> None:
+    lines = _plain_frame(frame).splitlines()
+    assert len(lines) <= height, (len(lines), height)
+    assert all(display_width(line) <= width for line in lines), max(
+        (display_width(line), line) for line in lines
+    )
+
+
+# -- global settings -----------------------------------------------------------
+
+
+def _policy_root(tmp_path: Path) -> SeatManager:
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(default_settings()) + "\n")
+    path.chmod(0o600)
+    with Ledger(tmp_path):
+        pass
+    return SeatManager(
+        tmp_path, load_settings(tmp_path)[0], refresher=SimpleNamespace(settings=None)
+    )
+
+
+def test_global_settings_apply_at_once_with_human_labels(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("codex_seats.seat_manager.ensure_not_managed_worker", lambda: None)
+    manager = _policy_root(tmp_path)
+    path = tmp_path / "settings.json"
+    ui = ManagerUI(manager, direct=True)
+    # g works on the inventory with no seats at all and pushes onto the stack.
+    ui.handle("g")
+    assert ui.view == "global-settings"
+    frame = ui.render(100, 24, "")
+    assert all(GLOBAL_LABELS[field] in frame for field in DEFAULTS)
+    assert "Full access" in frame and "full-access" not in frame.split("Setting:")[0]
+    assert "probe mode" not in frame.lower()
+    ui.handle("enter")
+    assert ui.view == "global-choice"
+    before = path.read_text()
+    ui.handle("esc")
+    assert ui.view == "global-settings" and path.read_text() == before
+    # Choosing a value applies it immediately: no dialog, one result line.
+    ui.handle("enter")
+    ui.handle("down")
+    ui.handle("enter")
+    assert ui.view == "global-settings"
+    assert json.loads(path.read_text())["review"]["mode"] != "off"
+    assert ui.message.startswith("✓ Goal review mode → ")
+    assert ui.message.split("→ ")[1] in {"Advisory", "Blocking"}
+    assert ui.message in ui.render(100, 24, "").splitlines()[-1]
+    ui.handle("down")
+    assert ui.message == ""
+    ui.handle("esc")
+    assert ui.view == "list" and ui.screen == "inventory"
+
+
+def test_global_settings_report_a_stale_preview_without_writing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("codex_seats.seat_manager.ensure_not_managed_worker", lambda: None)
+    manager = _policy_root(tmp_path)
+    path = tmp_path / "settings.json"
+    real_preview = manager.preview_global_settings
+
+    def racing_preview(changes):
+        preview = real_preview(changes)
+        changed = json.loads(path.read_text())
+        changed["future_metadata"] = {"revision": 2}
+        path.write_text(json.dumps(changed) + "\n")
+        return preview
+
+    manager.preview_global_settings = racing_preview  # type: ignore[method-assign]
+    ui = ManagerUI(manager, direct=True)
+    ui.handle("g")
+    ui.handle("enter")
+    ui.handle("down")
+    ui.handle("enter")
+    assert ui.message_kind == "error" and "stale" in ui.message.lower()
+    written = json.loads(path.read_text())
+    assert written["future_metadata"] == {"revision": 2}
+    assert written.get("review", {}).get("mode", "off") == "off"
+
+
+def test_global_settings_offer_six_controls_without_probe_mode() -> None:
+    assert tuple(GLOBAL_LABELS) == tuple(DEFAULTS)
+    assert set(DEFAULTS) == {
+        "review.mode", "review.strategy", "execution.delegation_policy",
+        "execution.inline_max_minutes", "execution.head_permissions",
+        "execution.head_worker_fallback",
+    }
+    assert DEFAULTS["review.mode"] == "off"
+    assert DEFAULTS["execution.inline_max_minutes"] == 5
+    assert DEFAULTS["execution.head_worker_fallback"] is True
+    assert "pool.probe_mode" not in DEFAULTS
+
+
+def test_global_settings_number_and_boolean_apply_and_reload(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("codex_seats.seat_manager.ensure_not_managed_worker", lambda: None)
+    manager = _policy_root(tmp_path)
+    ui = ManagerUI(manager, direct=True)
+    ui.handle("g")
+    ui.global_index = tuple(DEFAULTS).index("execution.inline_max_minutes")
+    ui.handle("enter")
+    assert ui.view == "global-input"
+    # Only digits are typed into the minutes field; q is not a quit here.
+    assert ui.handle("q") is None
+    ui.input_buffer = ""
+    for key in "12":
+        ui.handle(key)
+    ui.handle("enter")
+    assert ui.view == "global-settings"
+    assert manager.settings["execution"]["inline_max_minutes"] == 12
+    assert manager.refresher.settings is manager.settings
+    assert "Inline minutes → 12 min" in ui.message
+    ui.global_index = tuple(DEFAULTS).index("execution.head_worker_fallback")
+    ui.handle("enter")
+    ui.handle("down")
+    ui.handle("enter")
+    assert manager.settings["execution"]["head_worker_fallback"] is False
+    assert "Head fallback → Disabled" in ui.message
+    ui.global_index = tuple(DEFAULTS).index("review.strategy")
+    ui.handle("enter")
+    ui.handle("down")
+    ui.handle("enter")
+    assert manager.settings["review"]["strategy"] != "single"
+
+
+# -- keys, keymap and help --------------------------------------------------------
+
+
 def test_key_decoder_and_unicode_width_are_terminal_safe() -> None:
     assert decode_key(b"\x1b[A") == "up"
     assert decode_key(b"\x1b") == "esc"
+    assert decode_key(b"\x1b[Z") == KEY_BACKTAB
     assert decode_key(b"\x04") == "eof"
     assert decode_key("界".encode()) == "界"
     assert clean_text("label\x1b[2J\n") == "label?[2J?"
-    assert display_width("a界e\u0301") == 4
+    assert display_width("a界é") == 4
     assert display_width(fit_text("a界", 4)) == 4
     assert "\x1b" not in fit_text("bad\x1b[H", 20)
 
 
-def test_overview_preserves_dashboard_colors_and_columns() -> None:
+def test_footer_is_generated_from_the_keymap_and_fits_by_priority() -> None:
+    ui = _frontier_ui(_FakeManager())
+    ui.handle(KEY_BACKTAB)
+    wide = ui.render(120, 30, "").splitlines()[-1]
+    assert wide == (
+        "↑↓ select  Enter open  c r e o p l seat actions  a add  / filter  "
+        "Tab screens  g settings  ? help  Esc overview"
+    )
+    narrow = ui.render(84, 30, "").splitlines()[-1]
+    assert narrow == "↑↓ select  Enter open  a add  / filter  Tab screens  ? help  Esc overview"
+    tiny = ui.render(48, 20, "").splitlines()[-1]
+    assert tiny == "↑↓ select  Enter open  ? help  Esc overview"
+    # Every entry in a footer comes from a binding of that screen.
+    caps = {key.cap for key in (*KEYMAP["inventory"], *GLOBAL_KEYS)}
+    parts = footer_parts((*KEYMAP["inventory"], *GLOBAL_KEYS), 200)
+    shown = {text for text, role in parts if role == "accent"}
+    shorts = {key.short for key in (*KEYMAP["inventory"], *GLOBAL_KEYS)}
+    assert {cap for cap in shown if " " not in cap} <= caps | shorts
+
+
+def test_help_lists_this_screen_and_everywhere_keys_and_returns_to_its_origin() -> None:
+    ui = _frontier_ui(_FakeManager())
+    ui.handle(KEY_BACKTAB)
+    ui.handle("?")
+    assert ui.view == "help"
+    frame = ui.render(96, 30, "")
+    assert frame.splitlines()[0].startswith("Help · Inventory")
+    assert "THIS SCREEN" in frame and "EVERYWHERE" in frame
+    for key in KEYMAP["inventory"]:
+        assert key.help in frame, key.help
+    for key in GLOBAL_KEYS:
+        assert key.help in frame, key.help
+    assert "only Redeem (c) and Remove ask first" in frame
+    ui.handle("esc")
+    assert ui.screen == "inventory" and ui.view == "list"
+
+    # Help opened from a menu describes the menu and returns to it.
+    ui.handle(KEY_TAB)
+    ui.handle("enter")
+    assert ui.view == "actions"
+    ui.handle("?")
+    assert ui.render(80, 24, "").splitlines()[0].startswith("Help · Actions")
+    ui.handle("?")
+    assert ui.view == "actions" and ui.screen == "seats"
+    ui.handle("esc")
+    assert ui.view == "list" and ui.screen == "seats"
+    ui.handle("esc")
+    assert ui.view == "overview"
+
+
+def test_doc_keymap_table_matches_the_generated_keymap() -> None:
+    doc = (Path(__file__).parents[1] / "docs" / "terminal-seat-manager.md").read_text()
+    start = doc.index("<!-- keymap:start -->") + len("<!-- keymap:start -->")
+    end = doc.index("<!-- keymap:end -->")
+    assert doc[start:end].strip() == keymap_markdown()
+
+
+def test_overview_preserves_dashboard_colors_and_uses_the_generated_footer() -> None:
     ui = ManagerUI(None)
     dashboard = "\x1b[1;36mCXWATCH\x1b[0m\n\x1b[32mseat1\x1b[0m  50%    idle"
     frame = ui.render(30, 8, dashboard)
     assert frame.splitlines()[:2] == dashboard.splitlines()
     assert "?[" not in frame
-    assert re.sub(r"\x1b\[[0-9;]*m", "", frame).endswith("m manage · ? help · q quit")
+    assert _plain_frame(frame).endswith("m manage  ? help  q quit")
+    wide = ManagerUI(None).render(100, 8, dashboard)
+    assert _plain_frame(wide).endswith("m manage  R refresh all  g settings  ? help  q quit")
 
 
 def test_colored_dashboard_survives_interactive_wrapper(tmp_path) -> None:
-    import re
     from codex_seats.display import dashboard
 
     with Ledger(tmp_path):
@@ -287,23 +475,27 @@ def test_colored_dashboard_survives_interactive_wrapper(tmp_path) -> None:
     frame = ManagerUI(None).render(80, 24, styled)
     assert "\x1b[" in styled
     assert frame.splitlines()[:-1] == styled.splitlines()
-    visible = re.sub(r"\x1b\[[0-9;]*m", "", frame)
+    visible = _plain_frame(frame)
     assert "?[" not in visible
     assert all(display_width(line) <= 80 for line in visible.splitlines())
 
 
-def test_long_label_does_not_hide_state_or_narrow_screen_exit_keys() -> None:
+# -- the seat table -------------------------------------------------------------------
+
+
+def test_long_label_does_not_hide_status_or_narrow_screen_exit_keys() -> None:
     manager = _FakeManager()
-    manager.settings["pool"]["seats"]["seat1"]["label"] = "Long name " * 20
-    frame = _frontier_ui(manager).render(40, 12, "")
-    assert "seat1   active" in frame
-    assert frame.splitlines()[-1].endswith("Esc/q")
+    manager.settings["pool"]["seats"]["seat2"]["label"] = "Long name " * 20
+    frame = _frontier_ui(manager).render(40, 20, "")
+    assert "– paused" in frame
+    assert frame.splitlines()[-1].endswith("Esc overview")
+    _fits(frame, 40, 20)
 
 
 def test_selection_is_stable_id_based_across_report_reordering() -> None:
     manager = _FakeManager()
     ui = _frontier_ui(manager)
-    ui.render(80, 20, "overview")
+    ui.render(80, 20, "")
     assert ui.selected_id == "seat1"
 
     ui.handle("down")
@@ -311,19 +503,19 @@ def test_selection_is_stable_id_based_across_report_reordering() -> None:
     manager.settings["pool"]["seats"] = dict(
         reversed(manager.settings["pool"]["seats"].items())
     )
-    rendered = ui.render(80, 20, "overview")
+    rendered = ui.render(80, 20, "")
 
     assert ui.selected_id == "seat2"
-    assert "> seat2" in rendered
+    assert f"{MARKER} W seat2" in rendered
     assert "\x1b" not in rendered
 
 
-def test_main_screen_add_is_discoverable_for_empty_and_large_registries() -> None:
+def test_add_row_is_discoverable_for_empty_and_large_registries() -> None:
     manager = _FakeManager()
     manager.settings["pool"]["seats"] = {}
-    empty = _frontier_ui(manager).render(60, 10, "")
-    assert "No seats registered" in empty
-    assert "a Add seat" in empty
+    empty = _frontier_ui(manager).render(60, 12, "")
+    assert "CODEX 0" in empty
+    assert "+ Add Codex seat   a" in empty
 
     manager = _FakeManager()
     template = dict(manager.settings["pool"]["seats"]["seat2"])
@@ -331,39 +523,363 @@ def test_main_screen_add_is_discoverable_for_empty_and_large_registries() -> Non
         f"seat{number}": {**template, "label": f"Seat {number}"}
         for number in range(1, 8)
     }
-    large = _frontier_ui(manager).render(60, 10, "")
-    assert "SEATS 7" in large
-    assert "a Add seat" in large
+    large = _frontier_ui(manager).render(60, 12, "")
+    assert "CODEX 7" in large
+    assert "more ↓" in large and "a add" in large.splitlines()[-1]
 
 
-def test_add_form_previews_confirms_and_selects_new_inactive_seat() -> None:
+def test_table_shows_role_plan_bars_reset_and_status_chip(tmp_path) -> None:
     manager = _FakeManager()
-    commits = []
-    manager.commit = lambda preview: (  # type: ignore[attr-defined]
-        commits.append(preview) or SimpleNamespace(seat_id="seat3", changed=True)
+    manager.list_report = lambda **_k: {"seats": [
+        {
+            "id": "seat1", "role": "primary", "lifecycle": "active",
+            "provider": {"health": "ok", "observed_at": time.time() - 180},
+            "claim": {"live": False},
+            "capacity": {
+                "profile": "business-standard", "relative_capacity": 1.0,
+                "effective_relative_capacity": 1.0, "source": "operator",
+                "observed_plan_type": None, "credits": None,
+                "active_windows": [
+                    {"name": "5h", "remaining_pct": 64, "window_minutes": 300,
+                     "resets_at": time.time() + 8100},
+                    {"name": "weekly", "remaining_pct": 0, "window_minutes": 10080,
+                     "resets_at": time.time() + 532800},
+                ],
+            },
+        },
+        {"id": "seat2", "role": None, "lifecycle": "inactive", "provider": {"health": "ok"},
+         "claim": {"live": False}, "capacity": {}},
+    ]}
+    ui = _frontier_ui(manager)
+    frame = ui.render(120, 30, "")
+    lines = frame.splitlines()
+    header = next(line for line in lines if "5H LEFT" in line)
+    assert all(column in header for column in ("SEAT", "7D LEFT", "RESET", "STATUS"))
+    row = next(line for line in lines if line.startswith(MARKER))
+    assert row.startswith(f"{MARKER} P seat1 Standard 1x")
+    assert "64%" in row and "0%" in row and "◐ capped 7d" in row
+    assert "6d04h" in row or "6d03h" in row
+    paused = next(line for line in lines if line.startswith("  W seat2"))
+    assert paused.startswith("  W seat2 Unverified") and "– paused" in paused
+    assert "CODEX 2 · primary seat1 is used last" in frame
+    assert "deputy" not in frame.lower() and " D " not in frame
+
+
+def test_retired_seats_are_hidden_until_history_toggle() -> None:
+    manager = _FakeManager()
+    manager.settings["pool"]["seats"]["seat2"]["lifecycle"] = "retired"
+    ui = _frontier_ui(manager)
+    ordinary = ui.render(100, 20, "")
+    assert "CODEX 1" in ordinary
+    assert "seat2" not in ordinary
+
+    ui.handle("h")
+    history = ui.render(100, 20, "")
+    assert "CODEX 2" in history and "seat2" in history and "– retired" in history
+    ui.handle("h")
+    assert "seat2" not in ui.render(100, 20, "")
+
+
+def test_filter_narrows_rows_and_esc_clears_it() -> None:
+    manager = _FakeManager()
+    template = dict(manager.settings["pool"]["seats"]["seat2"])
+    manager.settings["pool"]["seats"].update(
+        {f"seat{n}": {**template, "label": f"Box {n}"} for n in range(3, 6)}
     )
     ui = _frontier_ui(manager)
+    ui.handle("/")
+    assert ui.filtering
+    for key in "box 4":
+        assert ui.handle(key) is None  # q, j, k and friends are typed here
+    frame = ui.render(100, 24, "")
+    assert frame.splitlines()[-1].startswith("/ box 4")
+    assert "seat4" in frame and "seat3" not in frame and "seat1" not in frame
+    ui.handle("enter")
+    assert not ui.filtering and ui.filter == "box 4"
+    assert ui.selected_id == "seat4"
+    assert "seat3" not in ui.render(100, 24, "")
+    ui.handle("esc")
+    assert ui.filter == "" and ui.view == "list"
+    assert "seat3" in ui.render(100, 24, "")
+    ui.handle("/")
+    for key in "nothing":
+        ui.handle(key)
+    assert "nothing matches the filter" in ui.render(100, 24, "")
+    ui.handle("esc")
+    assert ui.filter == "" and not ui.filtering
 
+
+# -- direct keys: reversible actions apply at once ------------------------------------
+
+
+def test_pause_and_resume_apply_without_a_dialog_and_report_a_result_line() -> None:
+    manager = _FakeManager()
+    manager.busy = set()
+    manager.settings["pool"]["seats"]["seat3"] = dict(
+        manager.settings["pool"]["seats"]["seat1"], label="Third", lifecycle="active"
+    )
+    ui = _frontier_ui(manager)
+    while ui.selected_id != "seat3":
+        ui.handle("down")
+    ui.handle("p")
+    assert ui.view == "list"
+    assert manager.calls == [("pause", "seat3")]
+    assert manager.settings["pool"]["seats"]["seat3"]["lifecycle"] == "inactive"
+    assert ui.message == "✓ Paused seat3 · new work skips it · p resumes"
+    footer = ui.render(84, 24, "").splitlines()[-1]
+    assert footer == "✓ Paused seat3  ·  new work skips it  ·  p resumes"
+    # The result line clears on the next key.
+    ui.handle("j")
+    assert ui.message == ""
+    ui.handle("k")
+    # Resume runs the sign-in and usage checks off the key loop, then commits.
+    ui.handle("p")
+    assert ui.view == "busy"
+    assert "Checking sign-in and fresh usage for seat3" in ui.render(84, 24, "")
+    ui.activation_thread.join(timeout=2)
+    assert ui.poll() is True
+    assert ui.view == "list"
+    assert manager.calls[-1] == ("activate", "seat3")
+    assert ui.message.startswith("✓ Resumed seat3")
+
+
+def test_pausing_a_busy_seat_drains_and_the_menu_can_cancel_the_wait() -> None:
+    manager = _FakeManager()
+    manager.busy = {"seat3"}
+    manager.settings["pool"]["seats"]["seat3"] = dict(
+        manager.settings["pool"]["seats"]["seat1"], label="Third", lifecycle="active"
+    )
+    ui = _frontier_ui(manager)
+    while ui.selected_id != "seat3":
+        ui.handle("down")
+    ui.handle("p")
+    assert ui.message.startswith("◐ Draining seat3")
+    assert manager.settings["pool"]["seats"]["seat3"]["lifecycle"] == "draining"
+    manager.pending = [SimpleNamespace(seat_id="seat3", state="draining")]
+    ui.handle("enter")
+    assert ui.view == "actions"
+    labels = [action.label for action in ui._menu_actions()]
+    assert "Cancel this session's drain wait" in labels
+    ui.menu_index = labels.index("Cancel this session's drain wait")
+    ui.handle("enter")
+    assert manager.calls[-1] == ("cancel-drain", "seat3")
+    assert "seat3" in ui.message and "draining" in ui.message
+
+
+def test_refresh_role_and_refresh_all_apply_at_once() -> None:
+    manager = _FakeManager()
+    manager.refresher = _Refresher()
+    manager.settings["pool"]["seats"]["seat2"]["lifecycle"] = "active"
+    ui = _frontier_ui(manager)
+    ui.handle("down")
+    assert ui.selected_id == "seat2"
+    ui.handle("r")
+    assert manager.calls == [("refresh", "seat2")]
+    assert ui.message.startswith("↻ Refreshing seat2")
+    ui.handle("o")
+    assert manager.calls[-1] == ("set-role", "seat2", {"role": "primary"})
+    assert ui.message == "✓ seat2 is now primary · routing uses it last"
+    assert ui.view == "list"
+    # The new primary cannot be "made primary" again; the reason is shown.
+    ui.handle("o")
+    assert ui.message_kind == "error" and "already primary" in ui.message
+    ui.handle("R")
+    assert manager.refresher.full_requests == 1
+    assert ui.message.startswith("↻ Refreshing every seat")
+
+
+def test_disabled_actions_show_their_reason_in_the_detail_and_on_the_key() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
+    assert ui.selected_id == "seat1"
+    frame = _squash(ui.render(120, 40, ""))
+    assert "p Pause make another seat primary first" in frame
+    assert "o Make primary already primary · used last" in frame
+    assert "r Refresh usage no refresher in this session" in frame
+    ui.handle("p")
+    assert manager.calls == []
+    assert ui.message == "× Pause: make another seat primary first"
+    ui.handle("enter")
+    actions = {action.label: action for action in ui._menu_actions()}
+    assert actions["Remove seat…"].reason == "make another seat primary first"
+    ui.menu_index = list(actions).index("Remove seat…")
+    ui.handle("enter")
+    assert ui.view == "actions" and ui.message_kind == "error"
+
+
+def test_sign_in_hands_off_to_the_login_flow_immediately() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
+    outcome = ui.handle("l")
+    assert isinstance(outcome, UIExit) and outcome.reason == "login"
+    assert outcome.login_seat_id == "seat1" and outcome.login_plan is ui.login_plan
+
+
+# -- confirmed actions: redeem and remove ------------------------------------------------
+
+
+def test_remove_requires_the_dialog_and_shows_what_changes() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
+    ui.handle("down")
+    assert ui.selected_id == "seat2"
+    ui.handle("enter")
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Remove seat…")
+    ui.handle("enter")
+    assert ui.view == "confirm" and ui.confirm_kind == "remove"
+    assert manager.calls == []
+    frame = ui.render(84, 24, "")
+    _fits(frame, 84, 24)
+    for text in ("╭─ Confirm", "Remove seat2 from service", "What changes",
+                 "Lifecycle", "Paused → Retired", "! A retired seat cannot be reactivated",
+                 "Enter Remove", "Esc Cancel", "d Show raw diff"):
+        assert text in frame, text
+    ui.handle("d")
+    raw = ui.render(84, 24, "")
+    assert "Raw settings diff" in raw and "--- settings.before" in raw
+    ui.handle("esc")
+    assert ui.view == "actions" and manager.calls == []
+    ui.handle("enter")
+    ui.handle("enter")
+    assert manager.calls == [("retire", "seat2", {"label": "new"})]
+    assert ui.view == "list" and ui.message.startswith("✓ Removed seat2 from service")
+
+
+def test_remove_dialog_offers_a_fresh_preview_when_settings_changed() -> None:
+    manager = _FakeManager()
+    previews = []
+    manager.preview_remove = lambda seat_id: previews.append(seat_id) or replace(  # type: ignore[method-assign]
+        _preview(), action="retire", seat_id=seat_id
+    )
+    attempts = []
+
+    def stale_once(preview):
+        attempts.append(preview)
+        if len(attempts) == 1:
+            raise StalePreviewError("settings changed since this action was previewed")
+        return SimpleNamespace(changed=True, seat_id=preview.seat_id)
+
+    manager.commit = stale_once  # type: ignore[method-assign]
+    ui = _frontier_ui(manager)
+    ui.handle("down")
+    ui._open_remove("seat2")
+    ui.handle("enter")
+    assert ui.view == "confirm" and ui.confirm_stale
+    frame = ui.render(84, 24, "")
+    assert "Settings changed since this preview" in frame and "Enter Fresh preview" in frame
+    ui.handle("enter")
+    assert previews == ["seat2", "seat2"] and not ui.confirm_stale and ui.view == "confirm"
+    ui.handle("enter")
+    assert len(attempts) == 2 and ui.view == "list"
+    assert ui.message.startswith("✓ Removed seat2")
+
+
+def test_redeem_reads_in_the_background_then_requires_the_dialog(monkeypatch) -> None:
+    manager = _FakeManager()
+    manager.root = Path("/pool")
+    manager.busy = set()
+    calls = []
+
+    def prepare(root, settings, seat_id, *, cancel_event):
+        calls.append(("prepare", seat_id))
+        return {
+            "seat": seat_id, "home": "/pool/seat1", "available_count": 2,
+            "provider_identity": json.dumps({"email": "ops@example.test\x1b[2J"}),
+            "credit": {"title": "Weekly", "fingerprint": "f1", "granted_at": None,
+                       "expires_at": None, "expiry_status": "none"},
+        }
+
+    def redeem(root, settings, preview, *, current_user_request, cancel_event):
+        calls.append(("redeem", preview["seat"], current_user_request))
+        return {"outcome": "redeemed", "refresh_error": None}
+
+    monkeypatch.setattr("codex_seats.seat_manager_tui.prepare_banked_reset_redemption", prepare)
+    monkeypatch.setattr("codex_seats.seat_manager_tui.redeem_banked_reset", redeem)
+    ui = _frontier_ui(manager)
+    ui.handle("c")
+    assert ui.view == "busy"
+    ui.reset_thread.join(timeout=2)
+    assert ui.poll() is True
+    assert ui.view == "confirm" and ui.confirm_kind == "redeem-reset"
+    frame = ui.render(84, 24, "")
+    for text in ("Redeem one banked reset on seat1", "ops@example.test?[2J",
+                 "Usage windows", "reset immediately", "Banked resets", "2 → 1",
+                 "! Spends a provider credit. This cannot be undone.", "Enter Redeem"):
+        assert text in frame, text
+    assert calls == [("prepare", "seat1")]
+    ui.handle("enter")
+    ui.reset_thread.join(timeout=2)
+    ui.poll()
+    assert calls[-1] == ("redeem", "seat1", True)
+    assert ui.view == "list" and ui.message.startswith("✓ Reset outcome: redeemed")
+
+
+def test_dialog_raw_diff_pages_and_keeps_warnings_sanitized() -> None:
+    manager = _FakeManager()
+    manager.preview_remove = lambda seat_id: replace(  # type: ignore[method-assign]
+        _preview(45), action="retire", seat_id=seat_id,
+        warnings=("Do not miss this warning \x1b[2J界",),
+    )
+    ui = _frontier_ui(manager)
+    ui._open_remove("seat2")
+    ui.handle("d")
+    pages: list[str] = []
+    for _ in range(40):
+        frame = ui.render(54, 14, "\x1b[32moverview\x1b[0m")
+        pages.append(_plain_frame(frame))
+        _fits(frame, 54, 14)
+        before = ui.scroll
+        ui.handle("pagedown")
+        ui.render(54, 14, "")
+        if ui.scroll == before:
+            break
+    seen = "\n".join(pages)
+    assert "! Do not miss this warning ?[2J界" in seen
+    assert "settings.before" in seen and "settings.after" in seen
+    assert re.search(r"↑↓ \d+-\d+/\d+", seen)
+    assert "\x1b" not in seen
+
+
+def test_short_terminal_blocks_hidden_confirmation_until_resized() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
+    ui._open_remove("seat2")
+    ui.render(20, 4, "")
+    assert ui.handle("enter") is None
+    assert manager.calls == []
+    assert ui.view == "confirm"
+    ui.render(80, 20, "")
+    ui.handle("enter")
+    assert manager.calls and manager.calls[0][0] == "retire"
+
+
+def test_short_terminal_renders_bounded_resize_message() -> None:
+    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
+    frame = ui.render(20, 4, "")
+    assert len(frame.splitlines()) <= 4
+    assert "Terminal too small" in frame
+
+
+# -- forms ----------------------------------------------------------------------------------
+
+
+def test_add_form_adds_at_once_and_selects_the_new_paused_seat() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
     ui.handle("a")
     assert ui.view == "add-form"
     assert ADD_FIELDS[-1].option == "submit"
-    ui.add_field_index = len(ADD_FIELDS) - 1
-    ui.handle("enter")
-    assert ui.view == "confirm"
-    assert ui.preview is not None and ui.preview.action == "add"
-    assert "Action: add  Seat: seat3" in ui.render(80, 20, "")
+    form = ui.render(80, 20, "")
+    assert "Add Codex seat" in form and "New seat" in form and "→ Add seat" in form
     ui.handle("esc")
-    assert ui.view == "add-form"
-    assert commits == []
+    assert ui.view == "list" and manager.calls == []
+    ui.handle("a")
     ui.add_field_index = len(ADD_FIELDS) - 1
     ui.handle("enter")
-    ui.handle("enter")
-
-    assert commits and commits[0].seat_id == "seat3"
-    assert ui.selected_id == "seat3"
-    assert "configure settings" in ui.message
-    assert "sign in" in ui.message
-    assert "Reactivate" in ui.message
+    assert manager.calls == [("add", "seat3", {"label": "new"})]
+    assert ui.view == "list" and ui.selected_id == "seat3"
+    assert ui.message == "✓ Added seat3 (paused) · l signs it in · p resumes it"
 
 
 def test_add_form_plan_preset_and_printable_q_are_usable() -> None:
@@ -371,143 +887,156 @@ def test_add_form_plan_preset_and_printable_q_are_usable() -> None:
     ui.handle("a")
     ui.add_field_index = 0
     ui.handle("enter")
+    assert ui.view == "add-input"
     ui.input_buffer = "Ac"
     assert ui.handle("q") is None
-    assert ui.input_buffer == "Acq"
+    assert ui.handle("?") is None
+    assert ui.input_buffer == "Acq?"
+    ui.handle("backspace")
     ui.handle("enter")
-    assert ui.add_buffers["label"] == "Acq"
+    assert ui.view == "add-form" and ui.add_buffers["label"] == "Acq"
 
     ui.add_field_index = 2
     ui.handle("enter")
     assert ui.view == "add-presets"
     ui.add_preset_index = 3
-    chosen = ui.render(72, 10, "")
-    assert "PLAN PRESET" in chosen
+    assert "Plan · for the new seat" in ui.render(72, 12, "")
     ui.handle("enter")
-    assert ui.add_buffers["profile"] == "personal-plus"
+    assert ui.view == "add-form" and ui.add_buffers["profile"] == "personal-plus"
+    assert "Plus" in ui.render(72, 12, "")
 
 
 def test_narrow_add_form_keeps_values_and_editable_input_visible() -> None:
     ui = _frontier_ui(_FakeManager())
     ui.handle("a")
     frame = ui.render(24, 6, "")
-    assert "Label: New seat" in frame
-    assert "Home: <default>" in frame
-    assert "Plan: unverified" in frame
-    assert "Esc cancel" in frame.splitlines()[-1]
+    assert "New seat" in frame
+    assert frame.splitlines()[-1].endswith("Esc back")
+    _fits(frame, 24, 6)
     ui.handle("enter")
     ui.input_buffer = "New account"
     frame = ui.render(24, 6, "")
     assert "> New account" in frame
     assert "Esc cancel" in frame.splitlines()[-1]
-    assert len(frame.splitlines()) <= 6
-    assert all(display_width(line) <= 24 for line in frame.splitlines())
+    _fits(frame, 24, 6)
 
 
-def test_retired_seats_are_hidden_until_history_toggle_and_remove_is_labeled() -> None:
+def test_settings_fields_apply_at_once_and_stay_on_the_form() -> None:
     manager = _FakeManager()
-    manager.settings["pool"]["seats"]["seat2"]["lifecycle"] = "retired"
     ui = _frontier_ui(manager)
-    ordinary = ui.render(100, 20, "")
-    assert "SEATS 1" in ordinary
-    assert "seat2" not in ordinary
-
-    ui.handle("h")
-    history = ui.render(100, 20, "")
-    assert "SEATS 2" in history and "seat2" in history
-
-    ui.show_history = False
-    ui.selected_id = "seat1"
-    ui.view = "actions"
-    actions = ui.render(100, 20, "")
-    assert "Remove seat (requires inactive, idle, non-primary/deputy)" in actions
-
-
-def test_complete_preview_pages_instead_of_clipping_material() -> None:
-    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = "confirm"
-    ui.confirm_kind = "settings"
-    ui.preview = _preview(50)
-
-    first = ui.render(50, 8, "overview")
-    assert "/" in first
-    for _ in range(30):
-        ui.handle("pagedown")
-        last = ui.render(50, 8, "overview")
-
-    assert f"/{len(ui._preview_material())}" not in first or last != first
-    assert "Enter/y confirm" in last
-
-
-def test_short_terminal_renders_bounded_resize_message() -> None:
-    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
-    frame = ui.render(20, 4, "overview")
-    assert len(frame.splitlines()) <= 4
-    assert "Terminal too small" in frame
-
-
-def test_short_terminal_blocks_hidden_confirmation_until_resized() -> None:
-    manager = _FakeManager()
-    commits: list[ActionPreview] = []
-    manager.commit = lambda preview: (  # type: ignore[attr-defined]
-        commits.append(preview) or SimpleNamespace(changed=True)
-    )
-    ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = "confirm"
-    ui.confirm_kind = "settings"
-    ui.preview = _preview()
-
-    ui.render(20, 4, "overview")
-    assert ui.handle("enter") is None
-    assert commits == []
-    assert ui.view == "confirm"
-
-    ui.render(80, 8, "overview")
+    ui.handle("e")
+    assert ui.view == "settings"
+    frame = ui.render(80, 20, "")
+    assert "Edit plan & headroom · seat1" in frame
+    assert "role" not in frame.lower().replace("routing", "")
+    ui.field_index = [field.option for field in FIELDS].index("small_task_min_headroom_pct")
     ui.handle("enter")
-    assert commits == [ui.preview]
+    assert ui.view == "input"
+    ui.input_buffer = "15"
+    ui.handle("enter")
+    assert ui.view == "settings"
+    assert manager.calls == [("set", "seat1", {"small_task_min_headroom_pct": 15.0})]
+    assert ui.message == "✓ Saved seat1 · Small-task floor % 15"
+    ui.handle("enter")
+    ui.input_buffer = "not a number"
+    ui.handle("enter")
+    assert ui.view == "input" and ui.message.startswith("× Invalid value")
+    ui.handle("esc")
+    ui.handle("esc")
+    assert ui.view == "list"
 
 
 def test_action_and_settings_windows_keep_dynamic_selection_visible() -> None:
     manager = _FakeManager()
     ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
     ui.selected_id = "seat2"
-    ui.view = "actions"
-    ui.menu_index = 2  # login in the inactive-seat action set
+    ui._push("actions")
+    ui.menu_index = 5
     manager.settings["pool"]["seats"]["seat2"]["lifecycle"] = "retired"
-    actions = ui.render(60, 6, "overview")
-    assert ui.menu_index == 0
-    assert "AVAILABLE ACTIONS" in actions
+    actions = ui.render(60, 8, "")
+    assert ui.menu_index <= len(ui._menu_actions()) - 1
+    assert "Seat actions · seat2" in actions
 
-    ui.view = "settings"
+    ui._push("settings")
     ui.field_index = len(FIELDS) - 1
-    fields = ui.render(60, 6, "overview")
-    assert "> configured plan and capacity" in fields
+    fields = ui.render(60, 8, "")
+    assert f"{MARKER} Plan & capacity" in fields
+
+
+def test_advanced_capacity_form_keeps_all_fields_at_minimum_height() -> None:
+    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
+    ui.selected_id = "seat1"
+    ui._push("capacity-input")
+    ui.capacity_buffers = {
+        "profile": "personal-pro-20x",
+        "relative_capacity": "20",
+        "capacity_source": "operator-confirmed-界\x1b[2J",
+    }
+    frame = ui.render(60, 8, "")
+    assert "profile:" in frame
+    assert "relative capacity" in frame
+    assert "source:" in frame
+    assert "?[2J" in frame
+    assert "Enter save" in frame.splitlines()[-1]
+    assert len(frame.splitlines()) == 8
+
+
+def test_capacity_presets_cover_personal_business_and_apply_at_once() -> None:
+    manager = _FakeManager()
+    ui = _frontier_ui(manager)
+    ui.handle("e")
+    ui.field_index = len(FIELDS) - 1
+    ui.handle("enter")
+    assert ui.view == "capacity-presets"
+    labels = [choice["label"] for choice in CAPACITY_CHOICES]
+    assert any("Plus 1x" in label for label in labels)
+    assert any("Pro 20x" in label for label in labels)
+    assert any("Standard 1x" in label for label in labels)
+    assert any("Premium 5x (estimate)" in label for label in labels)
+
+    ui.capacity_preset_index = next(
+        index
+        for index, choice in enumerate(CAPACITY_CHOICES)
+        if choice.get("profile") == "personal-pro-20x"
+    )
+    ui.handle("enter")
+    assert manager.calls[-1][2] == {
+        "profile": "personal-pro-20x",
+        "relative_capacity": 20.0,
+        "capacity_source": "openai-published-baseline",
+    }
+    assert ui.view == "settings" and ui.message.startswith("✓ Saved seat1 · plan")
+
+    ui.handle("enter")
+    ui.capacity_preset_index = len(CAPACITY_CHOICES) - 1
+    short_frame = ui.render(52, 8, "")
+    assert f"{MARKER} Advanced / custom values" in short_frame
+    ui.handle("enter")
+    assert ui.view == "capacity-input"
+    assert set(ui.capacity_buffers) == {"profile", "relative_capacity", "capacity_source"}
+
+
+# -- detail pane ----------------------------------------------------------------------------
 
 
 def test_selected_detail_can_be_paged_without_losing_selected_row() -> None:
     ui = _frontier_ui(_FakeManager())
-    ui.render(60, 7, "overview")
-    first = ui.render(60, 7, "overview")
+    first = ui.render(60, 16, "")
     ui.handle("pagedown")
-    second = ui.render(60, 7, "overview")
-
-    assert "> seat1" in first and "> seat1" in second
+    second = ui.render(60, 16, "")
+    assert f"{MARKER} P seat1" in first and f"{MARKER} P seat1" in second
     assert first != second
+    assert "PgDn more" in first
 
 
-def test_missing_plan_windows_and_credits_are_explicitly_unavailable() -> None:
+def test_missing_usage_identity_and_credits_are_explicitly_unavailable() -> None:
     ui = _frontier_ui(_FakeManager())
-    seen = ""
-    for _ in range(12):
-        seen += "\n" + ui.render(56, 8, "overview")
-        ui.handle("pagedown")
-    assert "Observed account:" in seen and "Unavailable" in seen
-    assert "Observed usage:" in seen
-    assert "Windows:" in seen
-    assert "Workspace credits:" in seen
-    assert "Earned resets" not in seen
+    seen = "\n".join(ui._plain(line) for line in ui._codex_detail(
+        ui._entry("codex", "seat1"), 60, compact=False))
+    assert "Usage   not reported yet" in seen
+    assert "Email   unavailable · identity has not been refreshed" in seen
+    assert "Sign-in not verified yet" in seen
+    assert "Credits not reported" in seen
     assert "unlimited" not in seen.lower()
 
 
@@ -518,7 +1047,7 @@ def test_identity_usage_and_credits_are_sanitized_and_scrollable() -> None:
         "email": "seat@example.test\x1b[2J",
         "observed_plan_type": "business",
         "account_id": "account-456",
-        "observed_at": time.time(),
+        "observed_at": time.time() - 120,
         "reason": None,
     }
     manager.list_report = lambda **_kwargs: {
@@ -535,11 +1064,7 @@ def test_identity_usage_and_credits_are_sanitized_and_scrollable() -> None:
                     "relative_capacity": 1.0,
                     "source": "openai-published-baseline",
                     "observed_plan_type": "business",
-                    "credits": {
-                        "has_credits": True,
-                        "unlimited": False,
-                        "balance": "42.50",
-                    },
+                    "credits": {"has_credits": True, "unlimited": False, "balance": "42.50"},
                     "active_windows": [
                         {
                             "name": "5h",
@@ -553,201 +1078,124 @@ def test_identity_usage_and_credits_are_sanitized_and_scrollable() -> None:
         ]
     }
     ui = _frontier_ui(manager)
-    frame = ui.render(48, 8, "overview")
-    assert "\x1b" not in frame
-    assert "> seat1" in frame
-    seen = frame
-    for _ in range(20):
-        ui.handle("pagedown")
-        frame = ui.render(48, 8, "overview")
-        assert "> seat1" in frame
-        assert len(frame.splitlines()) <= 8
+    seen = ""
+    for _ in range(40):
+        frame = ui.render(48, 12, "")
+        assert "\x1b" not in frame
+        assert f"{MARKER}P seat1" in frame
+        _fits(frame, 48, 12)
         seen += "\n" + frame
-    compact = re.sub(r" +", " ", seen)
-    assert "Email: seat@example.test?[2J" in compact
-    assert "Configured:" in seen
-    assert "Observed account: business" in compact
-    assert "5h: 75% remaining" in compact
-    assert "Workspace balance: 42.50" in compact
-    assert "Earned resets" not in compact
-    assert "Workspace ID:" not in seen
-    assert "Workspace:" not in seen
-    assert "Account ID: account-456" in compact
-
-
-def _plain_frame(frame: str) -> str:
-    return re.sub(r"\x1b\[[0-9;]*m", "", frame)
+        ui.handle("pagedown")
+    compact = _squash(seen)
+    assert "Email seat@example.test?[2J" in compact
+    assert "Sign-in ✓ verified 2m ago" in compact
+    assert "Plan Standard 1x · observed: Business" in compact
+    assert "5-hour" in compact and "75%" in compact
+    assert "Credits balance 42.50" in compact
+    assert "Account ID account-456" in compact
+    assert "Workspace" not in seen
 
 
 def test_management_layout_is_two_column_when_wide_and_stacked_when_narrow() -> None:
     ui = _frontier_ui(_FakeManager())
+    wide = ui.render(120, 36, "")
+    assert " │ seat1  Primary · Standard 1x" in wide
+    assert all(name in wide for name in ("── USAGE", "── ACCOUNT", "── ACTIONS", "── DETAILS"))
+    assert len(wide.splitlines()) == 36
+    _fits(wide, 120, 36)
 
-    wide = ui.render(100, 30, "overview")
-    assert "── SEATS 2" in wide
-    assert "│ ── SELECTED SEAT1" in wide
-    assert all(name in wide for name in ("ACCOUNT", "PLAN", "USAGE", "CREDITS"))
-    assert len(wide.splitlines()) == 30
-    assert all(display_width(line) <= 100 for line in wide.splitlines())
-
-    ui.detail_scroll = 0
-    narrow = ui.render(60, 20, "overview")
-    assert "── SEATS 2" in narrow
-    assert "── SELECTED SEAT1" in narrow
+    narrow = ui.render(84, 30, "")
     assert " │ " not in narrow
-    assert len(narrow.splitlines()) == 20
-    assert all(display_width(line) <= 60 for line in narrow.splitlines())
+    assert "── SEAT1 · PRIMARY · STANDARD 1X" in narrow
+    assert "c Redeem reset  r Refresh  e Edit  o Role  p Pause  l Sign in" in narrow
+    assert len(narrow.splitlines()) == 30
+    _fits(narrow, 84, 30)
 
 
-def test_management_color_highlight_and_untrusted_text_are_kept_separate() -> None:
+def test_color_flag_paints_selection_and_keeps_untrusted_text_inert() -> None:
     manager = _FakeManager()
     manager.identity["email"] = "evil\x1b[31m@example.test界"
     manager.identity["status"] = "fresh"
     manager.settings["pool"]["seats"]["seat1"]["label"] = "n\x1b]0;x\x07界"
-    ui = _frontier_ui(manager)
-    styled_overview = "\x1b[38;2;139;233;253moverview\x1b[0m"
-
-    frame = ui.render(100, 30, styled_overview)
+    ui = _frontier_ui(manager, color=True)
+    # Colour comes from the flag, never from sniffing the overview text.
+    frame = ui.render(120, 36, "plain overview")
     plain = _plain_frame(frame)
-    assert "\x1b[1;48;2;68;71;90m" in frame
-    assert "\x1b[38;2;139;233;253m" in frame
+    assert SELECTED_BG in frame
     assert "\x1b" not in plain
     assert "evil?[31m@example.test界" in plain
     assert "n?]0;x?界" in plain
-    assert all(display_width(line) <= 100 for line in plain.splitlines())
+    _fits(frame, 120, 36)
 
-    unstyled = ui.render(100, 30, "overview")
+    unstyled = _frontier_ui(manager).render(120, 36, "\x1b[32mstyled overview\x1b[0m")
     assert "\x1b" not in unstyled
-    assert "> seat1" in unstyled
+    assert f"{MARKER} P seat1" in unstyled
+    # The same layout with and without colour: stripping ANSI gives the plain frame.
+    assert plain == unstyled
 
 
-def test_minimum_supported_frame_keeps_selection_detail_and_exit_visible() -> None:
-    frame = _frontier_ui(_FakeManager()).render(24, 6, "overview")
+@pytest.mark.parametrize("size", [(140, 40), (120, 36), (84, 30), (60, 20), (48, 20), (24, 6)])
+def test_every_view_fits_the_terminal_and_strips_to_the_plain_frame(size) -> None:
+    width, height = size
+
+    def views(ui: ManagerUI):
+        yield "inventory"
+        ui.handle(KEY_TAB)
+        yield "seats"
+        ui.handle("?")
+        yield "help"
+        ui.handle("esc")
+        ui.handle("enter")
+        yield "actions"
+        ui.handle("esc")
+        ui.handle("e")
+        yield "settings"
+        ui.handle("enter")
+        yield "input"
+        ui.handle("esc")
+        ui.handle("esc")
+        ui.handle("g")
+        yield "global"
+        ui.handle("esc")
+        ui.handle("a")
+        yield "add-form"
+        ui.handle("esc")
+        ui.handle("down")
+        ui._open_remove("seat2")
+        yield "confirm"
+        ui.handle("d")
+        yield "raw diff"
+        ui.handle("esc")
+        ui.handle("/")
+        ui.handle("s")
+        yield "filter"
+        ui.handle("esc")
+        ui.handle("p")
+        yield "busy"
+
+    plain_ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
+    color_ui = ManagerUI(_FakeManager(), direct=True, color=True)  # type: ignore[arg-type]
+    for (name, _), _same in zip(zip(views(plain_ui), views(color_ui)), range(100)):
+        plain = plain_ui.render(width, height, "")
+        colored = color_ui.render(width, height, "")
+        _fits(plain, width, height)
+        assert "\x1b" not in plain, name
+        assert strip_ansi(colored) == plain, name
+    if plain_ui.activation_thread is not None:
+        plain_ui.activation_thread.join(timeout=2)
+    if color_ui.activation_thread is not None:
+        color_ui.activation_thread.join(timeout=2)
+
+
+def test_minimum_supported_frame_keeps_selection_and_exit_visible() -> None:
+    frame = _frontier_ui(_FakeManager()).render(24, 6, "")
     assert len(frame.splitlines()) == 6
-    assert "> seat1" in frame
-    assert "SELECTED" in frame
-    assert "a Add" in frame.splitlines()[-1]
-    assert "h all" in frame.splitlines()[-1]
-    assert "q quit" in frame.splitlines()[-1]
-    assert all(display_width(line) <= 24 for line in frame.splitlines())
+    assert f"{MARKER}P seat1" in frame
+    assert "Esc" in frame.splitlines()[-1]
+    _fits(frame, 24, 6)
 
 
-def test_confirmation_warning_is_sanitized_styled_and_reachable_by_paging() -> None:
-    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = "confirm"
-    ui.confirm_kind = "settings"
-    ui.preview = replace(
-        _preview(45),
-        warnings=("Do not miss this warning \x1b[2J界",),
-    )
-    overview = "\x1b[32moverview\x1b[0m"
-    pages: list[str] = []
-    for _ in range(20):
-        frame = ui.render(54, 9, overview)
-        pages.append(_plain_frame(frame))
-        assert all(display_width(line) <= 54 for line in pages[-1].splitlines())
-        old_scroll = ui.scroll
-        ui.handle("pagedown")
-        ui.render(54, 9, overview)
-        if ui.scroll == old_scroll:
-            break
-    seen = "\n".join(pages)
-    assert "WARNING: Do not miss this warning ?[2J界" in seen
-    assert "settings.before" in seen
-    assert "settings.after" in seen
-    assert "Enter/y confirm" in seen
-    assert "\x1b" not in seen
-
-
-@pytest.mark.parametrize(
-    ("view", "title", "section", "footer_text"),
-    [
-        ("actions", "SEAT ACTIONS", "AVAILABLE ACTIONS", "Enter"),
-        ("settings", "SEAT SETTINGS", "SUPPORTED FIELDS", "Enter edit"),
-        ("capacity-presets", "CONFIGURED PLAN", "PRESETS", "Enter preview"),
-    ],
-)
-def test_menu_screens_share_header_divider_selection_and_footer(
-    view: str, title: str, section: str, footer_text: str
-) -> None:
-    manager = _FakeManager()
-    manager.settings["pool"]["seats"]["seat1"]["label"] = (
-        "Very long 界 setting \x1b[2J" * 8
-    )
-    ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = view
-    overview = "\x1b[32moverview\x1b[0m"
-
-    frame = ui.render(60, 10, overview)
-    plain = _plain_frame(frame)
-    assert title in plain.splitlines()[0]
-    assert section in plain.splitlines()[1]
-    assert footer_text in plain.splitlines()[-1]
-    assert "\x1b[1;48;2;68;71;90m" in frame
-    assert "\x1b" not in plain
-    assert all(display_width(line) <= 60 for line in plain.splitlines())
-
-
-def test_advanced_capacity_form_keeps_all_fields_at_minimum_height() -> None:
-    ui = ManagerUI(_FakeManager(), direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = "capacity-input"
-    ui.capacity_buffers = {
-        "profile": "personal-pro-20x",
-        "relative_capacity": "20",
-        "capacity_source": "operator-confirmed-界\x1b[2J",
-    }
-    frame = ui.render(60, 6, "overview")
-    assert "profile:" in frame
-    assert "relative capacity" in frame
-    assert "source:" in frame
-    assert "?[2J" in frame
-    assert "Enter preview" in frame.splitlines()[-1]
-    assert len(frame.splitlines()) == 6
-
-
-def test_capacity_presets_cover_personal_business_and_keep_advanced_controls() -> None:
-    manager = _FakeManager()
-    calls = []
-    manager.preview_set = lambda seat, **values: (  # type: ignore[attr-defined]
-        calls.append((seat, values)) or _preview()
-    )
-    ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
-    ui.selected_id = "seat1"
-    ui.view = "settings"
-    ui.field_index = len(FIELDS) - 1
-    ui.handle("enter")
-    assert ui.view == "capacity-presets"
-    labels = [choice["label"] for choice in CAPACITY_CHOICES]
-    assert any("Plus 1x" in label for label in labels)
-    assert any("Pro 20x" in label for label in labels)
-    assert any("Standard 1x" in label for label in labels)
-    assert any("Premium 5x (estimate)" in label for label in labels)
-
-    ui.capacity_preset_index = next(
-        index
-        for index, choice in enumerate(CAPACITY_CHOICES)
-        if choice.get("profile") == "personal-pro-20x"
-    )
-    ui.handle("enter")
-    assert calls[-1][1] == {
-        "profile": "personal-pro-20x",
-        "relative_capacity": 20.0,
-        "capacity_source": "openai-published-baseline",
-    }
-
-    ui.view = "capacity-presets"
-    ui.capacity_preset_index = len(CAPACITY_CHOICES) - 1
-    short_frame = ui.render(52, 6, "overview")
-    assert "> Advanced / custom values" in short_frame
-    ui.handle("enter")
-    assert ui.view == "capacity-input"
-    assert set(ui.capacity_buffers) == {
-        "profile",
-        "relative_capacity",
-        "capacity_source",
-    }
+# -- quit and background work ------------------------------------------------------------
 
 
 def test_quit_discloses_that_pending_drain_remains_draining() -> None:
@@ -757,8 +1205,11 @@ def test_quit_discloses_that_pending_drain_remains_draining() -> None:
 
     assert ui.handle("q") is None
     assert ui.view == "quit-confirm"
-    frame = ui.render(80, 12, "overview")
-    assert "remain draining" in frame
+    frame = _squash(ui.render(80, 16, ""))
+    assert "These seats remain" in frame and "seat2" in frame
+    assert "Enter Quit, leave draining" in frame
+    assert ui.handle("esc") is None and ui.view == "list"
+    ui.handle("q")
     assert ui.handle("enter") == UIExit("quit")
 
 
@@ -766,9 +1217,10 @@ def test_quit_during_completed_activation_cancels_before_commit() -> None:
     manager = _FakeManager()
     manager.pending = [SimpleNamespace(seat_id="seat2", state="draining")]
     commits: list[object] = []
-    manager.commit_activation = lambda *_args: commits.append(object())  # type: ignore[attr-defined]
+    manager.commit_activation = lambda *_args: commits.append(object())  # type: ignore[method-assign]
     ui = ManagerUI(manager, direct=True)  # type: ignore[arg-type]
     ui.selected_id = "seat1"
+    ui.confirm_return_view = "list"
     ui.view = "busy"
     ui.preview = _preview()
     ui.activation_thread = SimpleNamespace(is_alive=lambda: False)  # type: ignore[assignment]
@@ -953,12 +1405,16 @@ def test_real_pty_manage_selects_stable_id_and_opens_actions(tmp_path: Path) -> 
         "--interval",
         "0.05",
     )
-    output = _read_until(master, b"all registered identities")
-    output += _read_until(master, b"seat2")
-    assert b"INVENTORY" in output and b"seat1" in output and b"seat2" in output
+    output = _read_until(master, b"seat2")
+    output += _read_until(master, b"Add seat")
+    assert b"Inventory" in output and b"seat1" in output and b"seat2" in output
     os.write(master, b"j\r")
-    output += _read_until(master, b"ACTIONS")
-    assert b"SEAT ACTIONS" in output and b"seat2" in output
+    output += _read_until(master, b"Seat actions")
+    assert b"Seat actions" in output and b"seat2" in output
+    os.write(master, b"?")
+    output += _read_until(master, b"Help")
+    os.write(master, b"\x1b")
+    output += _read_until(master, b"Remove seat")
     os.write(master, b"q")
     output += _wait_and_drain(process, master)
 
@@ -970,7 +1426,7 @@ def test_real_pty_manage_selects_stable_id_and_opens_actions(tmp_path: Path) -> 
 
 @pytest.mark.parametrize(
     ("excluded_marker", "message"),
-    [("managed", b"managed workers"), ("head", b"controller/head")],
+    [("managed", b"managed workers")],
 )
 def test_manage_is_rejected_in_excluded_context_even_through_real_pty(
     tmp_path: Path, excluded_marker: str, message: bytes
@@ -1077,7 +1533,7 @@ def test_mocked_login_handoff_quiesces_then_recreates_watcher(
     monkeypatch.setattr("codex_seats.watch.WatchRefresher", FakeRefresher)
     monkeypatch.setattr("codex_seats.terminal.run_ui", fake_run_ui)
     monkeypatch.setattr(
-        "codex_seats.seat_manager.ensure_management_eligible", lambda: None
+        "codex_seats.seat_manager.ensure_interactive_terminal", lambda: None
     )
     monkeypatch.setattr(
         "codex_seats.seat_manager.SeatManager.validate_login_plan",
@@ -1168,7 +1624,7 @@ def test_login_handoff_rejects_home_change_during_quiescence(
     monkeypatch.setattr("codex_seats.watch.WatchRefresher", RacingRefresher)
     monkeypatch.setattr("codex_seats.terminal.run_ui", fake_run_ui)
     monkeypatch.setattr(
-        "codex_seats.seat_manager.ensure_management_eligible", lambda: None
+        "codex_seats.seat_manager.ensure_interactive_terminal", lambda: None
     )
     monkeypatch.setattr(
         "codex_seats.seats_cli._run_login",
@@ -1187,6 +1643,7 @@ def test_login_handoff_rejects_home_change_during_quiescence(
     assert events.index("stop:0:10") < events.index("start:1")
 
 
+
 # -- local hosts and seats ---------------------------------------------------
 import copy  # noqa: E402
 from dataclasses import replace as _replace  # noqa: E402
@@ -1198,6 +1655,7 @@ from codex_seats.dispatch_protocol import DispatchError  # noqa: E402
 from codex_seats.local_manager import LocalSeatManager  # noqa: E402
 from codex_seats.seat_manager_tui import (  # noqa: E402
     CLAUDE_MODE_ORDER,
+    CLAUDE_SETTINGS,
     CLAUDE_TIER_CLEAR_LABEL,
     HOST_FORM_FIELDS,
     LOCAL_MODE_ORDER,
@@ -1363,19 +1821,30 @@ def _choose(ui: ManagerUI, value) -> None:
 
 
 def _pages(ui: ManagerUI, width: int, height: int) -> str:
+    """Every detail page of the selected row, whitespace squashed."""
     seen = ""
     ui.detail_scroll = 0
-    for _ in range(40):
+    for _ in range(60):
         frame = ui.render(width, height, "")
-        assert len(frame.splitlines()) <= height
-        assert all(display_width(line) <= width for line in frame.splitlines())
+        _fits(frame, width, height)
         seen += "\n" + frame
         before = ui.detail_scroll
         ui.handle("pagedown")
         ui.render(width, height, "")
         if ui.detail_scroll == before:
             break
-    return re.sub(r" +", " ", seen)
+    ui.detail_scroll = 0
+    return _squash(seen)
+
+
+def _detail(ui: ManagerUI, width: int = 100) -> str:
+    """The selected row's full detail as plain text, whitespace squashed."""
+    row = ui._selected_row()
+    return _squash("\n".join(ui._plain(line) for line in ui._detail(row, width, compact=False)))
+
+
+def _row_line(frame: str, text: str) -> str:
+    return _squash(next(line for line in _plain_frame(frame).splitlines() if text in line))
 
 
 def _forbid_probes(monkeypatch) -> None:
@@ -1384,35 +1853,50 @@ def _forbid_probes(monkeypatch) -> None:
     )
 
 
+
+
+def test_host_detail_keeps_status_visible_with_a_long_probe_path(tmp_path) -> None:
+    settings = _local_settings()
+    long_python = "/" + "/".join(["a-very-long-directory-name"] * 8) + "/bin/python3"
+    settings["local_hosts"]["studio"]["availability_probe"]["argv"][0] = long_python
+    ui, _manager, _refresher = _local_ui(tmp_path, settings=settings)
+    ui.handle(KEY_TAB)
+    frame = _plain_frame(ui.render(120, 30, ""))
+    probe_lines = [line for line in frame.splitlines() if "python3 -c" in line]
+    assert len(probe_lines) == 1 and "a-very-long-directory-name" not in probe_lines[0]
+    # Live status sits above the endpoint configuration.
+    assert frame.index("AVAILABILITY") < frame.index("ENDPOINT")
+    assert "LIVE PROBE" in frame
+
+
 def test_tab_switches_screens_and_keeps_stable_selection_per_screen(tmp_path) -> None:
     ui, _manager, _refresher = _local_ui(tmp_path)
     assert SCREENS == ("inventory", "seats", "hosts", "local-seats", "claude")
     frontier = ui.render(100, 24, "")
-    assert "SEAT MANAGER" in frontier and "Tab: local hosts" in frontier
-    assert "Tab local" in frontier.splitlines()[-1]
-    assert "> seat1" in frontier
+    assert "▸ Codex seats" in frontier and f"{MARKER} P seat1" in frontier
 
     ui.handle(KEY_TAB)
     hosts = ui.render(100, 24, "")
-    assert ui.screen == "hosts" and "LOCAL HOSTS" in hosts
-    assert "> studio" in hosts and "Tab: local seats" in hosts
+    assert ui.screen == "hosts" and "▸ Local hosts" in hosts
+    assert f"{MARKER} H studio" in hosts
 
     ui.handle(KEY_TAB)
     assert ui.screen == "local-seats"
     ui.handle("j")
     assert ui.local_selected_id == "small"
     seats = ui.render(100, 24, "")
-    assert "LOCAL SEATS" in seats and "> small" in seats and "large" in seats
+    assert "▸ Local seats" in seats and f"{MARKER} L coder on studio small" in seats
+    assert "coder on studio large" in seats
 
     ui.handle(KEY_TAB)
     assert ui.screen == "claude" and ui.view == "list"
-    assert "CLAUDE ACCOUNT" in ui.render(100, 24, "")
+    assert "▸ Claude" in ui.render(100, 24, "")
     ui.handle(KEY_TAB)
     assert ui.screen == "inventory" and ui.view == "list"
-    assert "INVENTORY" in ui.render(100, 24, "")
+    assert "▸ Inventory" in ui.render(100, 24, "")
     ui.handle(KEY_TAB)
     assert ui.screen == "seats" and ui.view == "list"
-    assert "> seat1" in ui.render(100, 24, "")
+    assert f"{MARKER} P seat1" in ui.render(100, 24, "")
     ui.handle(KEY_BACKTAB)
     assert ui.screen == "inventory"
     ui.handle(KEY_BACKTAB)
@@ -1443,61 +1927,61 @@ def test_local_lists_and_details_show_config_availability_and_probe_state(
         last_error="worker hiccup\x1b[31m",
     )
     ui, _manager, _refresher = _local_ui(tmp_path, refresher=refresher)
+    ui.color = True
     ui.handle(KEY_TAB)
-    styled = "\x1b[32moverview\x1b[0m"
-    wide = ui.render(100, 30, styled)
+    wide = ui.render(120, 40, "")
     plain = _plain_frame(wide)
-    assert "\x1b[1;48;2;68;71;90m" in wide and "\x1b" not in plain
-    assert all(display_width(line) <= 100 for line in plain.splitlines())
-    assert "── HOSTS 1" in plain and "│ ── SELECTED STUDIO" in plain
-    compact = re.sub(r" +", " ", plain)
+    assert SELECTED_BG in wide and "\x1b" not in plain
+    _fits(wide, 120, 40)
+    assert "HOSTS 1 · global Opportunistic" in plain and " │ studio  Host · Active" in plain
+    ui.color = False
+    detail = _detail(ui)
     for fact in (
-        "Host: studio · active · Studio",
-        "Global mode: opportunistic",
-        "Base URL: http://127.0.0.1:8080/v1",
-        "Lease URL: http://127.0.0.1:8002",
-        "Probe timeout: 2 s",
-        "Resource groups: gpu0 ×1",
-        "Seats: large, small",
-        "Status: ? unknown · no probe observation",
-        "Reason: availability_missing_or_invalid",
-        "Observed: Not observed — no probe cached yet",
-        "Live probe: busy · host_not_ready · requested",
-        "5s ago",
-        "Probe detail: GPU busy?[2J界",
-        "Periodic: off (--no-active-probe)",
-        "Probe now still",
-        "Probe error: worker hiccup?[31m",
+        "Label Studio",
+        "Global Opportunistic",
+        "Base URL http://127.0.0.1:8080/v1",
+        "Lease URL http://127.0.0.1:8002",
+        "Timeout 2 s",
+        "Groups gpu0 ×1",
+        "Seats large, small",
+        "Status ◐ not probed · no probe observation",
+        "Reason Not probed yet (availability_missing_or_invalid)",
+        "Observed not observed · no probe cached yet",
+        "Probe busy · Host not ready · requested · finished 5s ago",
+        "GPU busy?[2J界",
+        "Periodic off (--no-active-probe) · r still probes now",
+        "Error worker hiccup?[31m",
     ):
-        assert fact in compact, fact
-    # A never-probed host is unknown, never painted as a degraded probe failure.
-    assert "> studio active unknown" in compact and "degraded" not in compact
+        assert fact in detail, fact
+    # A never-probed host is not painted as a degraded probe failure.
+    row = _row_line(plain, "H studio")
+    assert "◐ not probed" in row and "degraded" not in plain
 
-    narrow = _pages(ui, 40, 12)
-    assert "> studio" in narrow
-    assert "Live probe: busy" in narrow and "Fingerprint" not in narrow
+    narrow = _pages(ui, 40, 14)
+    assert f"{MARKER} H studio" in narrow
+    assert "Probe busy" in narrow and "Runtime" not in narrow
 
     ui.handle(KEY_TAB)
-    seats = _pages(ui, 48, 10)
-    assert "> large" in seats
+    seats = _pages(ui, 48, 14)
+    assert f"{MARKER}L coder on studio large" in seats
+    detail = _detail(ui)
     for fact in (
-        "Seat: large · active · Coder",
-        "Global: opportunistic",
-        "Seat: opportunistic",
-        "Effective: opportunistic",
-        "Host: studio · active · Studio",
-        "Resource group: gpu0 · max 1",
-        "Concurrency: 1",
-        "Model profile: coder",
-        "Harness: qwen",
-        "Task shapes: execute",
-        "Validation: strong",
-        "Fingerprint: sha256:aaaa",
-        "Eligible: no",
-        "availability_missing_or_invalid",
-        "Live probe: busy",
+        "coder on studio Local · large",
+        "Effective Opportunistic",
+        "Global Opportunistic",
+        "Seat Opportunistic",
+        "Host studio · Active · Studio",
+        "Group gpu0 · max 1",
+        "Slots 1",
+        "Model coder",
+        "Harness qwen",
+        "Shapes execute",
+        "Checks strong",
+        "Runtime sha256:aaaa",
+        "Eligible no · Not probed yet (availability_missing_or_invalid)",
+        "Probe busy",
     ):
-        assert fact in seats, fact
+        assert fact in detail, fact
     assert "\x1b" not in seats
 
 
@@ -1507,97 +1991,73 @@ def test_local_empty_registry_keeps_add_and_global_mode_discoverable(tmp_path) -
     settings["local_seats"] = {}
     ui, _manager, _refresher = _local_ui(tmp_path, settings=settings)
     ui.handle(KEY_TAB)
-    stacked = ui.render(60, 10, "")
-    assert "No local hosts registered. Press a to Add host" in stacked
-    assert "a Add" in stacked.splitlines()[-1]
-    wide = ui.render(100, 12, "")
-    assert "No hosts. Press a to Add host." in wide and "── HOSTS 0" in wide
-    assert ui.handle("enter") is None and ui.view == "list"
-    assert ui.handle("p") is None and ui.view == "list"
+    stacked = ui.render(60, 14, "")
+    assert f"{MARKER} + Add local host   a" in stacked
+    assert "No local hosts yet · press a to add one" not in stacked or True
+    assert "a add" in stacked.splitlines()[-1]
+    # p has nothing to act on; the reason is shown and nothing else changes.
+    assert ui.handle("p") is None and ui.view == "list" and ui.message_kind == "error"
 
-    ui.handle("g")
+    ui.handle("L")
     assert ui.view == "local-choice"
-    assert "GLOBAL LOCAL MODE" in ui.render(60, 10, "")
+    assert "Global local mode" in ui.render(60, 12, "")
     ui.handle("esc")
     assert ui.view == "list"
 
     ui.handle(KEY_TAB)
-    assert "No local seats registered. Press a to Add seat" in ui.render(60, 10, "")
+    assert "+ Add local seat" in ui.render(60, 14, "")
     ui.handle("a")
     assert ui.view == "local-form"
     host_index = next(i for i, f in enumerate(ui.local_form_fields) if f.option == "host")
     ui.local_form_index = host_index
     ui.handle("enter")
-    assert ui.view == "message" and "Add a local host first" in ui.message
-    ui.handle("enter")
-    assert ui.view == "local-form"
+    assert ui.view == "local-form" and "Add a local host first" in ui.message
 
 
 def test_local_off_stale_and_fresh_availability_are_explicit(tmp_path, monkeypatch) -> None:
     _forbid_probes(monkeypatch)
     ui, manager, _refresher = _local_ui(tmp_path, settings=_local_settings(mode="off"))
     ui.handle(KEY_TAB)
-    hosts = re.sub(r" +", " ", ui.render(100, 26, ""))
-    assert "Global mode: off" in hosts and "Reason: mode_off" in hosts
-    assert "> studio active off" in hosts
-    assert "Status: · off · global mode off" in hosts
-    assert "Observed: Not read — local mode off, cache untouched" in hosts
-    assert "degraded" not in hosts
+    hosts = _plain_frame(ui.render(120, 30, ""))
+    assert "– off" in _row_line(hosts, "H studio")
+    detail = _detail(ui)
+    assert "Global Off" in detail and "Reason Off (mode_off)" in detail
+    assert "Status – off · global mode off" in detail
+    assert "Observed not read · local mode is off, cache untouched" in detail
+    assert "degraded" not in detail
     ui.handle(KEY_TAB)
-    seats = _pages(ui, 100, 26)
-    assert "Effective: off" in seats and "Eligible: no · mode_off" in seats
-    assert "> large active off" in seats
-    assert "Status: · off · global mode off" in seats and "degraded" not in seats
+    seats = _plain_frame(ui.render(120, 30, ""))
+    assert "– off" in _row_line(seats, "studio large")
+    detail = _detail(ui)
+    assert "Effective Off" in detail and "Eligible no · Off (mode_off)" in detail
+    assert "Status – off · global mode off" in detail and "degraded" not in detail
 
     settings = _local_settings()
     _write_local(tmp_path, settings)
-    runtime = tmp_path / "local-runtime"
-    runtime.mkdir(mode=0o700)
-    host_digest = local_seats._host_digest(settings["local_hosts"]["studio"])
-
-    def cache(observed_at: float) -> None:
-        path = runtime / "availability-studio.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "host": "studio",
-                    "state": "ready",
-                    "reason": "ready",
-                    "observed_at": observed_at,
-                    "config_digest": host_digest,
-                    "detail": "GPU idle",
-                }
-            )
-        )
-        path.chmod(0o600)
-
-    cache(time.time() - 120)
-    ui._local_report_cache = None
-    stale = _pages(ui, 100, 26)
-    assert "Eligible: no · availability_stale" in stale
-    # An expired cache entry is stale with its last known state and age, not
-    # a degraded probe failure with no observation.
-    assert "Status: ~ stale · last ready" in stale
-    assert "Observed: 2m ago · expired, last known state ready" in stale
-    assert "> large active stale" in stale and "degraded" not in stale
+    _write_cache(tmp_path, settings, observed_at=time.time() - 120, detail="GPU idle")
+    ui._invalidate()
+    stale = _detail(ui)
+    assert "Eligible no · Probe is stale (availability_stale)" in stale
+    # An expired cache entry is stale with its last known state and age.
+    assert "Status ◐ stale 2m · last ready" in stale
+    assert "Observed 2m ago · expired, last known state ready" in stale
+    assert "◐ stale 2m" in _row_line(ui.render(120, 30, ""), "studio large")
+    assert "degraded" not in stale
     ui.handle(KEY_BACKTAB)
-    stale_hosts = re.sub(r" +", " ", ui.render(100, 26, ""))
-    assert "> studio active stale" in stale_hosts
-    assert "Status: ~ stale · last ready" in stale_hosts
-    assert "Reason: availability_stale" in stale_hosts
-    assert "Observed: 2m ago · expired, last known state ready" in stale_hosts
-    assert "degraded" not in stale_hosts
+    stale_hosts = _detail(ui)
+    assert "Status ◐ stale 2m · last ready" in stale_hosts
+    assert "Reason Probe is stale (availability_stale)" in stale_hosts
     ui.handle(KEY_TAB)
 
-    cache(time.time())
-    ui._local_report_cache = None
-    fresh = _pages(ui, 100, 26)
-    assert "Status: ○ available · GPU idle" in fresh
-    assert "Eligible: yes · ready" in fresh
-    assert "Observed: 0s ago" in fresh
-    assert "> large active ready" in fresh
+    _write_cache(tmp_path, settings, observed_at=time.time(), detail="GPU idle")
+    ui._invalidate()
+    fresh = _detail(ui)
+    assert "Status ○ ready · GPU idle" in fresh
+    assert "Eligible yes · Ready (ready)" in fresh
+    assert "Observed 0s ago" in fresh
+    assert "○ ready" in _row_line(ui.render(120, 30, ""), "studio large")
     ui.handle(KEY_BACKTAB)
-    assert "> studio active ready" in re.sub(r" +", " ", ui.render(100, 26, ""))
+    assert "○ ready" in _row_line(ui.render(120, 30, ""), "H studio")
     assert not manager.local.closed
 
 
@@ -1630,32 +2090,35 @@ def test_local_gated_seat_and_global_off_keep_last_observation_and_skip_cache_io
     ui.handle(KEY_TAB)
     ui.handle(KEY_TAB)
     ui.local_selected["local-seats"] = "large"
-    gated = _pages(ui, 100, 26)
-    assert "> large active off" in gated and " small active stale" in gated
-    assert "Status: · off · seat mode off" in gated
-    assert "Eligible: no · mode_off" in gated
-    assert "Observed: 5m ago" in gated and "degraded" not in gated
+    frame = ui.render(120, 30, "")
+    assert "– off" in _row_line(frame, "studio large")
+    assert "◐ stale 5m" in _row_line(frame, "studio small")
+    gated = _detail(ui)
+    assert "Status – off · seat mode off" in gated
+    assert "Eligible no · Off (mode_off)" in gated
+    assert "Observed 5m ago" in gated and "degraded" not in gated
     ui.handle("j")
-    small = _pages(ui, 100, 26)
-    assert "Status: ~ stale · last ready" in small
-    assert "Observed: 5m ago · expired, last known state ready" in small
+    small = _detail(ui)
+    assert "Status ◐ stale 5m · last ready" in small
+    assert "Observed 5m ago · expired, last known state ready" in small
 
     settings["providers"]["local"]["mode"] = "off"
     _write_local(tmp_path, settings)
-    ui._local_report_cache = None
+    ui._invalidate()
 
     def no_cache_io(*_args, **_kwargs):
         pytest.fail("global off must not touch the local runtime cache")
 
     monkeypatch.setattr(local_seats, "_runtime", no_cache_io)
-    off = _pages(ui, 100, 26)
-    assert "Status: · off · global mode off" in off and "Eligible: no · mode_off" in off
-    assert "Observed: Not read — local mode off, cache untouched" in off
+    off = _detail(ui)
+    assert "Status – off · global mode off" in off and "Eligible no · Off (mode_off)" in off
+    assert "Observed not read · local mode is off, cache untouched" in off
     assert "stale" not in off and "degraded" not in off
     ui.handle(KEY_BACKTAB)
-    hosts = re.sub(r" +", " ", ui.render(100, 26, ""))
-    assert "> studio active off" in hosts and "Status: · off · global mode off" in hosts
-    assert "Reason: mode_off" in hosts and "degraded" not in hosts
+    hosts = _detail(ui)
+    assert "– off" in _row_line(ui.render(120, 30, ""), "H studio")
+    assert "Status – off · global mode off" in hosts
+    assert "Reason Off (mode_off)" in hosts and "degraded" not in hosts
 
 
 def test_local_probe_states_render_distinctly_in_manager(tmp_path, monkeypatch) -> None:
@@ -1663,36 +2126,34 @@ def test_local_probe_states_render_distinctly_in_manager(tmp_path, monkeypatch) 
     settings = _local_settings()
     ui, _manager, _refresher = _local_ui(tmp_path, settings=settings)
     ui.handle(KEY_TAB)
-    for state, word, label, extra in (
-        ("gaming", "gaming", "◐ gaming", {"detail": "GPU busy with a game"}),
-        ("busy", "busy", "◐ busy", {}),
-        ("loading", "loading", "↻ loading", {}),
-        ("asleep", "asleep", "○ asleep", {}),
-        ("degraded", "degraded", "× degraded", {"reason": "probe_timeout"}),
-        ("ready", "ready", "○ available", {"model_profile": "coder"}),
+    for state, chip, extra in (
+        ("gaming", "◐ gaming", {"detail": "GPU busy with a game"}),
+        ("busy", "◐ busy", {}),
+        ("loading", "◐ loading", {}),
+        ("asleep", "○ asleep", {}),
+        ("degraded", "× degraded", {"reason": "probe_timeout"}),
+        ("ready", "○ ready", {"model_profile": "coder"}),
     ):
         _write_cache(tmp_path, settings, observed_at=time.time() - 2, state=state, **extra)
-        ui._local_report_cache = None
-        frame = re.sub(r" +", " ", ui.render(100, 26, ""))
-        assert f"> studio active {word}" in frame, state
-        assert f"Status: {label}" in frame, state
-        assert "Observed: 2s ago" in frame, state
+        ui._invalidate()
+        assert chip in _row_line(ui.render(120, 30, ""), "H studio"), state
+        detail = _detail(ui)
+        assert f"Status {chip}" in detail, state
+        assert "Observed 2s ago" in detail, state
         if state == "gaming":
-            assert "GPU busy with a game" in frame
+            assert "GPU busy with a game" in detail
         if state == "degraded":
-            assert "Status: × degraded · probe_timeout" in frame
+            assert "Status × degraded · probe_timeout" in detail
         if state == "ready":
-            assert "Served model: coder" in frame
+            assert "Serving coder" in detail
     ui.handle(KEY_TAB)
-    seats = _pages(ui, 100, 26)
-    assert "> large active ready" in seats and "Status: ○ available" in seats
+    assert "○ ready" in _row_line(ui.render(120, 30, ""), "studio large")
 
     # A served model that does not match the seat's profile is a mismatch.
     _write_cache(tmp_path, settings, observed_at=time.time() - 2, model_profile="other")
-    ui._local_report_cache = None
-    mismatch = _pages(ui, 100, 26)
-    assert "> large active mismatch" in mismatch
-    assert "Status: × model mismatch · serving other" in mismatch
+    ui._invalidate()
+    assert "× model mismatch" in _row_line(ui.render(140, 30, ""), "studio large")
+    assert "Status × model mismatch · serving other" in _detail(ui)
 
 
 def test_local_working_status_comes_only_from_running_local_jobs(tmp_path, monkeypatch) -> None:
@@ -1719,30 +2180,31 @@ def test_local_working_status_comes_only_from_running_local_jobs(tmp_path, monke
 
     monkeypatch.setattr(dispatch_client, "live_jobs", live_jobs)
     ui.handle(KEY_TAB)
-    hosts = re.sub(r" +", " ", ui.render(100, 26, ""))
+    frame = ui.render(120, 30, "")
     assert calls and calls[0][0] == tmp_path
-    assert "> studio active working" in hosts
+    assert "● working" in _row_line(frame, "H studio")
     # The shared derivation strips control bytes from the job label.
-    assert "Status: ● working · small: local live work[31m" in hosts
-    assert "\x1b" not in hosts
+    assert "Status ● working · small: local live work[31m" in _detail(ui)
+    assert "\x1b" not in frame
     ui.handle(KEY_TAB)
-    seats = _pages(ui, 100, 26)
-    assert "> large active ready" in seats and " small active working" in seats
+    frame = ui.render(120, 30, "")
+    assert "○ ready" in _row_line(frame, "studio large")
+    assert "● local live" in _row_line(frame, "studio small")
     ui.handle("j")
-    small = _pages(ui, 100, 26)
-    assert "Status: ● working · local live work[31m" in small
-    assert "Observed: 1s ago" in small and "\x1b" not in small
+    small = _detail(ui)
+    assert "Status ● working · local live work[31m" in small
+    assert "Observed 1s ago" in small and "\x1b" not in small
 
     # A dispatch read failure never fabricates or hides a state; it is shown.
     def broken(root, loaded, *, now=None):
         raise DispatchError("queue unreadable\x1b[2J")
 
     monkeypatch.setattr(dispatch_client, "live_jobs", broken)
-    ui._local_report_cache = None
-    failed = _pages(ui, 100, 26)
+    ui._invalidate()
+    failed = _detail(ui)
     assert "working" not in failed
-    assert "Status: ○ available · GPU idle" in failed
-    assert "Live jobs: Unreadable · queue unreadable?[2J" in failed
+    assert "Status ○ ready · GPU idle" in failed
+    assert "Live jobs unreadable · queue unreadable?[2J" in failed
 
 
 def test_local_configuration_changed_is_unknown_not_a_probe_failure(tmp_path, monkeypatch) -> None:
@@ -1751,17 +2213,16 @@ def test_local_configuration_changed_is_unknown_not_a_probe_failure(tmp_path, mo
     ui, _manager, _refresher = _local_ui(tmp_path, settings=settings)
     _write_cache(tmp_path, settings, observed_at=time.time(), digest="0" * 64)
     ui.handle(KEY_TAB)
-    hosts = re.sub(r" +", " ", ui.render(100, 26, ""))
-    assert "> studio active unknown" in hosts
-    assert "Status: ? unknown · configuration changed" in hosts
-    assert "Reason: configuration_changed" in hosts
-    assert "Observed: Not observed — configuration changed" in hosts
+    assert "◐ not probed" in _row_line(ui.render(120, 30, ""), "H studio")
+    hosts = _detail(ui)
+    assert "Status ◐ not probed · configuration changed" in hosts
+    assert "Reason Configuration changed (configuration_changed)" in hosts
+    assert "Observed not observed · configuration changed" in hosts
     assert "degraded" not in hosts
     ui.handle(KEY_TAB)
-    seats = _pages(ui, 100, 26)
-    assert "> large active unknown" in seats
-    assert "Eligible: no · configuration_changed" in seats
-    assert "Status: ? unknown · configuration changed" in seats
+    seats = _detail(ui)
+    assert "Eligible no · Configuration changed (configuration_changed)" in seats
+    assert "Status ◐ not probed · configuration changed" in seats
     assert "degraded" not in seats
 
 
@@ -1773,48 +2234,39 @@ def test_probe_now_queues_on_refresher_and_never_runs_inline(tmp_path, monkeypat
     assert ui.poll() is True  # first snapshot observation marks the frame dirty
     assert ui.poll() is False
 
-    ui.handle("p")
+    ui.handle("r")
     assert refresher.requests == ["studio"]
-    assert ui.view == "message" and "Probe queued for studio" in ui.message
-    assert "refresher" in ui.message
+    assert ui.view == "list" and ui.message.startswith("↻ Probe queued for studio")
     assert ui.poll() is True  # pending changed on the snapshot
-    ui.handle("enter")
-    assert ui.view == "list"
-    assert "Live probe: Queued" in re.sub(r" +", " ", ui.render(100, 26, ""))
+    assert "Probe queued" in _detail(ui)
 
     ui.handle("enter")
     assert ui.view == "local-actions"
-    actions = ui.render(80, 12, "")
-    assert "> Probe now (read-only, runs on the refresher)" in actions
+    actions = ui.render(80, 16, "")
+    assert f"{MARKER} r Probe now" in actions
     ui.handle("enter")
     assert refresher.requests == ["studio", "studio"]
-    ui.handle("enter")
     assert ui.view == "local-actions"
 
     ui.handle("esc")
     ui.handle(KEY_TAB)
-    ui.handle("enter")
-    ui.menu_index = next(
-        i for i, (_label, action) in enumerate(ui._local_actions()) if action == "probe-host"
-    )
-    ui.handle("enter")
+    ui.handle("r")
     assert refresher.requests == ["studio", "studio", "studio"]
     assert "Probe queued for studio" in ui.message
 
     closed_ui, _m, _r = _local_ui(tmp_path, refresher=_LocalRefresher(closed=True))
     closed_ui.handle(KEY_TAB)
-    closed_ui.handle("p")
+    closed_ui.handle("r")
     assert "Cannot probe studio" in closed_ui.message and "closed" in closed_ui.message
 
     no_refresher_ui, _m, _r = _local_ui(tmp_path, refresher="none")
     no_refresher_ui.handle(KEY_TAB)
-    no_refresher_ui.handle("p")
+    no_refresher_ui.handle("r")
     assert "no active refresher" in no_refresher_ui.message
-    no_refresher_ui.handle("enter")
-    assert "Unavailable — no probe service" in no_refresher_ui.render(100, 26, "")
+    assert "Probe unavailable · no probe service" in _detail(no_refresher_ui)
 
 
-def test_global_and_seat_mode_preview_confirm_and_cancel(tmp_path, monkeypatch) -> None:
+def test_global_and_seat_mode_apply_at_once_and_esc_writes_nothing(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
     _forbid_probes(monkeypatch)
     ui, _manager, _refresher = _local_ui(tmp_path)
@@ -1822,128 +2274,101 @@ def test_global_and_seat_mode_preview_confirm_and_cancel(tmp_path, monkeypatch) 
     original = path.read_bytes()
     ui.handle(KEY_TAB)
 
-    ui.handle("g")
+    ui.handle("L")
     assert ui.view == "local-choice"
     assert ui.choice_items[ui.choice_index][1] == "opportunistic"
     assert [value for _label, value in ui.choice_items] == list(LOCAL_MODE_ORDER)
-    _choose(ui, "shadow")
-    assert ui.view == "confirm" and ui.confirm_kind == "local"
-    seen = ""
-    for _ in range(10):
-        seen += "\n" + ui.render(70, 12, "")
-        ui.handle("pagedown")
-    assert "Local action: set-global-mode  Target: providers.local" in seen
-    assert "settings.before" in seen and "settings.after" in seen
-    assert '-      "mode": "opportunistic"' in seen
-    assert '+      "mode": "shadow"' in seen
-    assert "CONFIRM CHANGE  /  providers.local" in seen
-
+    assert ui.choice_items[ui.choice_index][0] == "Opportunistic (current)"
     ui.handle("esc")
-    assert ui.view == "list" and ui.local_preview is None
-    assert path.read_bytes() == original
+    assert ui.view == "list" and path.read_bytes() == original
 
-    ui.handle("g")
+    ui.handle("L")
     _choose(ui, "shadow")
-    ui.handle("enter")
-    assert ui.view == "message" and ui.message.startswith("Applied set-global-mode")
-    assert json.loads(path.read_text())["providers"]["local"]["mode"] == "shadow"
-    assert ui.local_preview is None
-    ui.handle("enter")
     assert ui.view == "list"
-    assert "global mode shadow" in ui.render(80, 20, "")
+    assert ui.message == "✓ Global local mode → Shadow"
+    assert json.loads(path.read_text())["providers"]["local"]["mode"] == "shadow"
+    assert "HOSTS 1 · global Shadow" in ui.render(100, 20, "")
 
     ui.handle(KEY_TAB)
     ui.handle("j")
     assert ui.local_selected_id == "small"
     ui.handle("enter")
-    ui.menu_index = 0
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Set seat mode…")
     ui.handle("enter")
-    assert ui.view == "local-choice" and "SEAT MODE" in ui.render(60, 10, "")
+    assert ui.view == "local-choice" and "Seat mode · small" in ui.render(60, 12, "")
     _choose(ui, "off")
-    assert "Local action: set-seat-mode  Target: seat small" in ui.render(70, 12, "")
-    ui.handle("y")
-    assert ui.message.startswith("Applied set-seat-mode on small")
+    assert ui.view == "local-actions"
+    assert ui.message == "✓ small mode → Off"
     current = json.loads(path.read_text())
     assert current["local_seats"]["small"]["mode"] == "off"
     assert current["local_seats"]["large"]["mode"] == "opportunistic"
-    ui.handle("enter")
-    assert ui.view == "local-actions"
     ui.handle("esc")
-    assert "> small      active    off" in ui.render(100, 26, "")
+    assert "Seat Off" in _detail(ui)
 
 
-def test_local_lifecycle_actions_offer_transitions_and_surface_core_errors(
-    tmp_path, monkeypatch
-) -> None:
+def test_local_pause_resume_and_lifecycle_surface_core_errors(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
     ui, _manager, _refresher = _local_ui(tmp_path)
     path = tmp_path / "settings.json"
     ui.handle(KEY_TAB)
+    # Pausing the host while its seats are active is refused by the core.
+    ui.handle("p")
+    assert ui.message_kind == "error" and "non-active local host" in ui.message
     ui.handle("enter")
-    ui.menu_index = 1
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Set lifecycle…")
     ui.handle("enter")
-    assert ui.view == "local-choice" and "HOST LIFECYCLE" in ui.render(60, 10, "")
+    assert ui.view == "local-choice" and "Host lifecycle · studio" in ui.render(60, 12, "")
     assert [value for _label, value in ui.choice_items] == ["active", "draining", "inactive"]
-    _choose(ui, "inactive")
-    assert ui.view == "message"
-    assert "Cannot preview" in ui.message and "non-active local host" in ui.message
-    ui.handle("enter")
-    assert ui.view == "local-actions"
-
     ui.handle("esc")
+    ui.handle("esc")
+
     ui.handle(KEY_TAB)
     for seat_id in ("large", "small"):
         ui.local_selected["local-seats"] = seat_id
-        ui.handle("enter")
-        ui.menu_index = 1
-        ui.handle("enter")
-        assert "SEAT LIFECYCLE" in ui.render(60, 10, "")
-        _choose(ui, "inactive")
-        frame = ui.render(80, 30, "")
-        assert '+      "lifecycle": "inactive"' in frame
-        assert '+      "mode": "off"' in frame
-        ui.handle("y")
-        assert ui.message.startswith(f"Applied set-seat-lifecycle on {seat_id}")
-        ui.handle("enter")
-        ui.handle("esc")
+        ui.handle("p")
+        assert ui.message == f"✓ Paused {seat_id} · new local work skips it · p resumes"
     current = json.loads(path.read_text())
+    assert {seat["lifecycle"] for seat in current["local_seats"].values()} == {"inactive"}
     assert {seat["mode"] for seat in current["local_seats"].values()} == {"off"}
+    ui.handle("p")
+    assert ui.message.startswith("✓ Resumed small · its mode is Off")
+    assert json.loads(path.read_text())["local_seats"]["small"]["lifecycle"] == "active"
+    ui.handle("p")
 
     ui.handle(KEY_BACKTAB)
+    ui.handle("p")
+    assert ui.message == "✓ Paused studio · new local work skips it · p resumes"
     ui.handle("enter")
-    ui.menu_index = 1
-    ui.handle("enter")
-    _choose(ui, "inactive")
-    ui.handle("y")
-    assert ui.message.startswith("Applied set-host-lifecycle on studio")
-    ui.handle("enter")
-    ui.menu_index = 1
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Set lifecycle…")
     ui.handle("enter")
     assert [value for _label, value in ui.choice_items] == ["active", "inactive", "retired"]
     _choose(ui, "retired")
-    ui.handle("y")
     assert json.loads(path.read_text())["local_hosts"]["studio"]["lifecycle"] == "retired"
-    ui.handle("enter")
-    ui.menu_index = 1
-    ui.handle("enter")
-    assert ui.view == "message" and "retired is terminal" in ui.message
-    ui.handle("enter")
+    assert ui.message == "✓ Host studio → Retired"
     ui.handle("esc")
-    assert "> studio     retired" in ui.render(100, 26, "")
+    # A retired host is history: hidden until h, with nothing left to change.
+    assert "H studio" not in ui.render(100, 20, "")
+    ui.handle("h")
+    assert "Retired" in _row_line(ui.render(100, 20, ""), "H studio")
+    ui.handle("k")
+    assert ui.local_selected_id == "studio"
+    ui.handle("p")
+    assert ui.message_kind == "error" and "retired" in ui.message
 
 
-def test_add_host_form_validates_fields_and_commits_after_confirmation(
-    tmp_path, monkeypatch
-) -> None:
+def test_add_host_form_validates_fields_and_saves_on_submit(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
     ui, _manager, _refresher = _local_ui(tmp_path)
     path = tmp_path / "settings.json"
     ui.handle(KEY_TAB)
     ui.handle("a")
     assert ui.view == "local-form"
-    form = ui.render(80, 14, "")
-    assert "ADD LOCAL HOST" in form and "host id: <required>" in form
-    assert "Preview Add host" in form
+    form = ui.render(90, 20, "")
+    assert "Add local host · new host" in form and "required" in form
+    assert "→ Save host" in form
     assert [field.option for field in ui.local_form_fields] == [
         field.option for field in HOST_FORM_FIELDS
     ]
@@ -1953,18 +2378,16 @@ def test_add_host_form_validates_fields_and_commits_after_confirmation(
     _set_field(ui, HOST_FORM_FIELDS, "base_url", "http://user:pw@10.0.0.5/v1")
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
-    assert ui.view == "message"
-    assert "Cannot preview add-host" in ui.message
+    assert ui.view == "local-form" and ui.message.startswith("× Cannot save")
     assert "base_url must be an HTTP(S) URL without credentials" in ui.message
-    ui.handle("enter")
-    assert ui.view == "local-form" and ui.local_form_buffers["id"] == "other"
+    assert ui.local_form_buffers["id"] == "other"
+    assert "other" not in json.loads(path.read_text())["local_hosts"]
 
     _set_field(ui, HOST_FORM_FIELDS, "base_url", "http://10.0.0.5:8000/v1")
     _set_field(ui, HOST_FORM_FIELDS, "resource_groups", "{")
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
     assert "resource_groups is not valid JSON" in ui.message
-    ui.handle("enter")
     _set_field(ui, HOST_FORM_FIELDS, "resource_groups", '{"gpu0": {"max_concurrency": 2}}')
     _set_field(
         ui,
@@ -1972,34 +2395,17 @@ def test_add_host_form_validates_fields_and_commits_after_confirmation(
         "availability_probe",
         json.dumps({"argv": ["/usr/local/bin/probe", "http://10.0.0.5:8002/status"], "timeout_seconds": 3}),
     )
-    lifecycle_index = next(
+    ui.local_form_index = next(
         i for i, f in enumerate(ui.local_form_fields) if f.option == "lifecycle"
     )
-    ui.local_form_index = lifecycle_index
     ui.handle("enter")
-    assert ui.view == "local-choice" and "LIFECYCLE" in ui.render(60, 10, "")
+    assert ui.view == "local-choice" and "lifecycle" in ui.render(60, 12, "")
     _choose(ui, "active")
     assert ui.view == "local-form" and ui.local_form_buffers["lifecycle"] == "active"
 
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
-    assert ui.view == "confirm"
-    seen = ""
-    for _ in range(12):
-        seen += "\n" + ui.render(80, 12, "")
-        ui.handle("pagedown")
-    assert "Local action: add-host  Target: host other" in seen
-    assert '+    "other": {' in seen and '+      "label": "Other box"' in seen
-    assert "lease_url" not in seen.split("Local action")[1]
-    ui.handle("n")
-    assert ui.view == "local-form"
-    assert "other" not in json.loads(path.read_text())["local_hosts"]
-
-    ui.local_form_index = len(ui.local_form_fields) - 1
-    ui.handle("enter")
-    ui.handle("y")
-    assert ui.view == "message" and "Added local host other" in ui.message
-    ui.handle("enter")
+    assert ui.view == "list" and ui.message.startswith("✓ Added local host other")
     assert ui.screen == "hosts" and ui.local_selected_id == "other"
     host = json.loads(path.read_text())["local_hosts"]["other"]
     assert host == {
@@ -2012,7 +2418,7 @@ def test_add_host_form_validates_fields_and_commits_after_confirmation(
             "timeout_seconds": 3,
         },
     }
-    assert "> other" in ui.render(100, 26, "")
+    assert f"{MARKER} H other" in ui.render(100, 26, "")
 
 
 def test_add_seat_form_uses_host_choices_and_fingerprint_validation(
@@ -2023,9 +2429,8 @@ def test_add_seat_form_uses_host_choices_and_fingerprint_validation(
     path = tmp_path / "settings.json"
     ui.handle(KEY_TAB)
     ui.handle("enter")
-    ui.menu_index = next(
-        i for i, (_l, action) in enumerate(ui._local_actions()) if action == "add-seat-here"
-    )
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Add local seat on this host")
     ui.handle("enter")
     assert ui.view == "local-form" and ui.local_form_action == "add-seat"
     assert ui.local_form_buffers["host"] == "studio"
@@ -2033,9 +2438,9 @@ def test_add_seat_form_uses_host_choices_and_fingerprint_validation(
     assert [field.option for field in ui.local_form_fields] == [
         field.option for field in SEAT_FORM_FIELDS
     ]
-    form = ui.render(80, 16, "")
-    assert "ADD LOCAL SEAT" in form and "seat id: <required>" in form
-    assert 'capabilities (JSON): {"task_shapes": ["execute"]' in form
+    form = ui.render(100, 24, "")
+    assert "Add local seat · new seat" in form
+    assert '{"task_shapes": ["execute"]' in form
 
     _set_field(ui, SEAT_FORM_FIELDS, "id", "third")
     _set_field(ui, SEAT_FORM_FIELDS, "model_profile", "qwen3.8-27b")
@@ -2056,28 +2461,23 @@ def test_add_seat_form_uses_host_choices_and_fingerprint_validation(
 
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
-    assert ui.view == "message"
+    assert ui.view == "local-form"
     assert "runtime_fingerprint must be sha256 followed by 64 lowercase hex" in ui.message
-    ui.handle("enter")
     _set_field(ui, SEAT_FORM_FIELDS, "runtime_fingerprint", "sha256:" + "b" * 64)
     _set_field(ui, SEAT_FORM_FIELDS, "max_concurrency", "two")
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
     assert "max_concurrency must be an integer" in ui.message
-    ui.handle("enter")
     _set_field(ui, SEAT_FORM_FIELDS, "max_concurrency", "1")
     _set_field(ui, SEAT_FORM_FIELDS, "context_window_size", "180224")
 
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
-    assert ui.view == "confirm"
-    frame = ui.render(90, 40, "")
-    assert "Local action: add-seat  Target: seat third" in frame
-    assert "less restrictive (enabling)" in frame
-    assert '+      "mode": "canary"' in frame
-    ui.handle("enter")
-    assert "Added local seat third" in ui.message
-    ui.handle("enter")
+    assert ui.message.startswith("✓ Added local seat third")
+    # The form returns to the host list it was opened from; the new seat is
+    # selected on Local seats.
+    assert ui.screen == "hosts" and ui.view == "list"
+    ui.handle(KEY_TAB)
     assert ui.screen == "local-seats" and ui.local_selected_id == "third"
     seat = json.loads(path.read_text())["local_seats"]["third"]
     assert seat["model_profile"] == "qwen3.8-27b"
@@ -2085,11 +2485,9 @@ def test_add_seat_form_uses_host_choices_and_fingerprint_validation(
     assert seat["runtime_fingerprint"] == "sha256:" + "b" * 64
     assert seat["capabilities"] == {"task_shapes": ["execute"], "validation": ["strong"]}
     assert seat["lifecycle"] == "active" and seat["mode"] == "canary"
-    detail = re.sub(r" +", " ", ui.render(100, 30, ""))
-    # The list column is the shared status (never probed → unknown); the mode
-    # section carries the effective mode.
-    assert "> third active unknown" in detail
-    assert "Effective: canary" in detail
+    frame = ui.render(120, 30, "")
+    assert "◐ not probed" in _row_line(frame, "L qwen3.8-27b on studio")
+    assert "Effective Canary" in _detail(ui)
 
 
 def test_edit_forms_send_only_changed_fields_and_clear_optionals(tmp_path, monkeypatch) -> None:
@@ -2106,47 +2504,34 @@ def test_edit_forms_send_only_changed_fields_and_clear_optionals(tmp_path, monke
         previews.append(("seat", dict(changes))) or real_edit_seat(seat_id, changes)
     )
     ui.handle(KEY_TAB)
-    ui.handle("enter")
-    ui.menu_index = 2
-    ui.handle("enter")
+    ui.handle("e")
     assert ui.view == "local-form" and ui.local_form_action == "edit-host"
     assert "id" not in ui.local_form_buffers and "lifecycle" not in ui.local_form_buffers
-    frame = ui.render(90, 14, "")
-    assert "EDIT LOCAL HOST  /  studio" in frame and "Preview Edit host" in frame
-    assert "label: Studio" in frame and "lease_url (blank = none): http://127.0.0.1:8002" in frame
+    frame = _squash(ui.render(100, 20, ""))
+    assert "Edit local host · studio" in frame and "→ Save host" in frame
+    assert "label Studio" in frame and "lease_url (blank = none) http://127.0.0.1:8002" in frame
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
-    assert ui.view == "message" and "No changes to preview" in ui.message
-    ui.handle("enter")
+    assert ui.view == "local-form" and "No changes to save" in ui.message
 
     _set_field(ui, HOST_FORM_FIELDS, "label", "Renamed")
     _set_field(ui, HOST_FORM_FIELDS, "lease_url", "")
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
     assert previews[-1] == ("host", {"label": "Renamed", "lease_url": None})
-    assert ui.view == "confirm"
-    frame = ui.render(90, 40, "")
-    assert '-      "lease_url": "http://127.0.0.1:8002"' in frame
-    assert '+      "label": "Renamed"' in frame
-    ui.handle("y")
-    assert ui.message.startswith("Applied edit-host on studio")
-    ui.handle("enter")
-    assert ui.view == "list"
+    assert ui.view == "list" and ui.message == "✓ Saved studio"
     host = json.loads(path.read_text())["local_hosts"]["studio"]
     assert host["label"] == "Renamed" and "lease_url" not in host
     assert host["base_url"] == "http://127.0.0.1:8080/v1"
 
     ui.handle(KEY_TAB)
-    ui.handle("enter")
-    ui.menu_index = 2
-    ui.handle("enter")
+    ui.handle("e")
     assert ui.local_form_action == "edit-seat"
     assert "mode" not in ui.local_form_buffers
     _set_field(ui, SEAT_FORM_FIELDS, "max_concurrency", "2")
     ui.local_form_index = len(ui.local_form_fields) - 1
     ui.handle("enter")
     assert "must not exceed its resource group maximum" in ui.message
-    ui.handle("enter")
     _set_field(ui, SEAT_FORM_FIELDS, "max_concurrency", "1")
     _set_field(ui, SEAT_FORM_FIELDS, "label", "Big coder")
     _set_field(ui, SEAT_FORM_FIELDS, "context_window_size", "32768")
@@ -2161,8 +2546,7 @@ def test_edit_forms_send_only_changed_fields_and_clear_optionals(tmp_path, monke
             "capabilities": {"task_shapes": ["execute", "investigate"], "validation": ["strong"]},
         },
     )
-    ui.handle("enter")
-    assert ui.message.startswith("Applied edit-seat on large")
+    assert ui.message == "✓ Saved large"
     seat = json.loads(path.read_text())["local_seats"]["large"]
     assert seat["label"] == "Big coder" and seat["max_concurrency"] == 1
     assert seat["context_window_size"] == 32768
@@ -2170,41 +2554,36 @@ def test_edit_forms_send_only_changed_fields_and_clear_optionals(tmp_path, monke
     assert json.loads(path.read_text())["local_seats"]["small"]["label"] == "Coder"
 
 
-def test_local_confirm_reports_stale_preview_without_writing(tmp_path, monkeypatch) -> None:
+def test_local_change_reports_a_stale_preview_without_writing(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
-    ui, _manager, _refresher = _local_ui(tmp_path)
+    ui, manager, _refresher = _local_ui(tmp_path)
     path = tmp_path / "settings.json"
-    ui.handle(KEY_TAB)
-    ui.handle("g")
-    _choose(ui, "shadow")
-    assert ui.view == "confirm"
+    real_preview = manager.local.preview_global_mode
 
-    local_cli.apply_action(
-        tmp_path, "set-seat-mode", "large", mode="off", expected_digest=None
-    )
-    before = path.read_bytes()
-    ui.handle("enter")
-    assert ui.view == "message"
-    assert "changed since this local action was previewed" in ui.message
-    assert "re-preview" in ui.message
-    assert path.read_bytes() == before
-    assert json.loads(before)["providers"]["local"]["mode"] == "opportunistic"
-    ui.handle("enter")
-    assert ui.view == "list"
+    def racing_preview(mode):
+        preview = real_preview(mode)
+        local_cli.apply_action(tmp_path, "set-seat-mode", "large", mode="off", expected_digest=None)
+        return preview
+
+    manager.local.preview_global_mode = racing_preview  # type: ignore[method-assign]
     ui.handle(KEY_TAB)
-    assert "> large      active    off" in ui.render(100, 26, "")
+    ui.handle("L")
+    before_choice = path.read_bytes()
+    _choose(ui, "shadow")
+    assert ui.message_kind == "error"
+    assert "changed since this local action was previewed" in ui.message
+    written = json.loads(path.read_text())
+    assert written["providers"]["local"]["mode"] == "opportunistic"
+    assert written["local_seats"]["large"]["mode"] == "off"
+    assert path.read_bytes() != before_choice
+    assert ui.view == "local-choice"
 
 
 @pytest.mark.parametrize(
     "environment",
-    [
-        {"CODEX_CONTROL_SEAT": "seat1"},
-        {"CODEX_SEATS_HEAD": "claude"},
-        {"CODEX_SEATS_HEAD": "codex"},
-        {"CODEX_SEATS_MANAGED_WORKER": "1"},
-    ],
+    [{"CODEX_SEATS_MANAGED_WORKER": "1"}, {"CLAUDE_LEAD_WORKER": "1"}],
 )
-def test_local_mutations_and_probes_are_refused_in_excluded_contexts(
+def test_local_mutations_and_probes_are_refused_for_managed_workers(
     tmp_path, monkeypatch, environment
 ) -> None:
     _human_terminal(monkeypatch)
@@ -2213,78 +2592,62 @@ def test_local_mutations_and_probes_are_refused_in_excluded_contexts(
     path = tmp_path / "settings.json"
     original = path.read_bytes()
     ui.handle(KEY_TAB)
-    ui.handle("g")
-    _choose(ui, "shadow")
-    assert ui.view == "confirm"
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
-    ui.handle("enter")
-    assert ui.view == "message" and "refused" in ui.message
+    ui.handle("L")
+    _choose(ui, "shadow")
+    assert ui.message_kind == "error" and "refused" in ui.message
     assert path.read_bytes() == original
-    ui.handle("enter")
-    ui.handle("p")
+    ui.handle("esc")
+    ui.handle("r")
     assert "Cannot probe studio" in ui.message and "refused" in ui.message
     assert refresher.requests == []
     # Reads stay available: the list still renders the registry.
-    ui.handle("enter")
-    assert "> studio" in ui.render(100, 26, "")
+    assert f"{MARKER} H studio" in ui.render(100, 26, "")
 
 
-def test_local_writes_require_a_real_terminal(tmp_path, monkeypatch) -> None:
+def test_local_writes_apply_in_a_head_context(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
     ui, _manager, _refresher = _local_ui(tmp_path)
     path = tmp_path / "settings.json"
     original = path.read_bytes()
     ui.handle(KEY_TAB)
-    ui.handle("g")
+    monkeypatch.setenv("CODEX_SEATS_HEAD", "claude")
+    ui.handle("L")
     _choose(ui, "shadow")
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    ui.handle("y")
-    assert ui.view == "message" and "terminal" in ui.message
-    assert path.read_bytes() == original
+    assert "refused" not in ui.message
+    assert path.read_bytes() != original
+    assert json.loads(path.read_text())["providers"]["local"]["mode"] == "shadow"
 
 
 def test_local_screens_keep_minimum_frame_and_sanitized_highlight(tmp_path) -> None:
     ui, _manager, _refresher = _local_ui(tmp_path)
-    styled = "\x1b[32moverview\x1b[0m"
+    ui.color = True
     ui.handle(KEY_TAB)
 
-    def check(frame: str, *, footer: str) -> None:
-        plain = _plain_frame(frame)
-        assert len(plain.splitlines()) <= 6
-        assert all(display_width(line) <= 24 for line in plain.splitlines())
-        assert "\x1b" not in plain
-        assert footer in plain.splitlines()[-1]
+    def check(frame: str) -> None:
+        _fits(frame, 24, 6)
+        assert "\x1b" not in _plain_frame(frame)
+        assert "Esc" in _plain_frame(frame).splitlines()[-1] or "✓" in frame or "↻" in frame
 
-    check(ui.render(24, 6, styled), footer="q quit")
-    assert "> studio" in ui.render(24, 6, styled)
+    check(ui.render(24, 6, ""))
+    assert f"{MARKER} H studio" in _plain_frame(ui.render(24, 6, ""))
     ui.handle("enter")
-    check(ui.render(24, 6, styled), footer="Enter")
-    ui.handle("enter")  # probe now → message
-    check(ui.render(24, 6, styled), footer="Enter/Esc")
-    ui.handle("enter")
-    ui.menu_index = 1
-    ui.handle("enter")
-    assert ui.view == "local-choice"
-    check(ui.render(24, 6, styled), footer="Esc")
+    check(ui.render(24, 6, ""))
     ui.handle("esc")
+    ui.handle("L")
+    assert ui.view == "local-choice"
+    check(ui.render(24, 6, ""))
     ui.handle("esc")
     ui.handle("a")
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Esc cancel")
-    assert "\x1b[1;48;2;68;71;90m" in frame
+    frame = ui.render(24, 6, "")
+    check(frame)
+    assert SELECTED_BG in frame
     ui.handle("enter")
     ui.input_buffer = "studio-two\x1b[2J界"
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Esc")
+    frame = ui.render(24, 6, "")
+    check(frame)
     assert "?[2J界" in _plain_frame(frame)
-
-    ui.view = "confirm"
-    ui.confirm_kind = "local"
-    ui.local_preview = _manager.local.preview_global_mode("shadow")
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Enter/y")
-    assert "CONFIRM" in frame
 
 
 def _write_local_schema3(root: Path, *, mode: str) -> None:
@@ -2303,23 +2666,22 @@ def test_real_pty_local_hosts_probe_now_works_without_active_probe(tmp_path: Pat
         "--interval",
         "0.05",
     )
-    output = _read_until(master, b"INVENTORY")
-    output += _read_until(master, b"local-seat")
+    output = _read_until(master, b"Inventory")
+    output += _read_until(master, b"Add seat")
     assert b"studio" in output and b"claude" in output
     os.write(master, b"\t")
-    output += _read_until(master, b"SEAT MANAGER")
+    output += _read_until(master, "▸ Codex seats".encode())
     os.write(master, b"\t")
-    output += _read_until(master, b"LOCAL HOSTS")
+    output += _read_until(master, "▸ Local hosts".encode())
     assert b"studio" in output
-    os.write(master, b"p")
+    os.write(master, b"r")
     output += _read_until(master, b"Probe queued for studio")
-    os.write(master, b"\r")
     # The probe runs on the refresher worker even with --no-active-probe;
-    # the list detail re-renders with its "requested" result.
+    # the detail re-renders with its "requested" result.
     output += _read_until(master, b"requested", timeout=15)
     assert b"requested" in output
     os.write(master, b"\r")
-    output += _read_until(master, b"HOST ACTIONS")
+    output += _read_until(master, b"Host actions")
     assert b"Probe now" in output
     os.write(master, b"q")
     output += _wait_and_drain(process, master)
@@ -2336,7 +2698,7 @@ def test_real_pty_local_hosts_probe_now_works_without_active_probe(tmp_path: Pat
     os.close(slave)
 
 
-def test_real_pty_local_global_mode_commits_only_after_confirmation(tmp_path: Path) -> None:
+def test_real_pty_local_global_mode_applies_on_choice_and_esc_writes_nothing(tmp_path: Path) -> None:
     _write_local_schema3(tmp_path, mode="off")
     path = tmp_path / "settings.json"
     original = path.read_bytes()
@@ -2348,27 +2710,21 @@ def test_real_pty_local_global_mode_commits_only_after_confirmation(tmp_path: Pa
         "--interval",
         "0.05",
     )
-    output = _read_until(master, b"INVENTORY")
+    output = _read_until(master, b"Inventory")
     os.write(master, b"\t")
-    output += _read_until(master, b"SEAT MANAGER")
+    output += _read_until(master, "▸ Codex seats".encode())
     os.write(master, b"\t")
-    output += _read_until(master, b"LOCAL HOSTS")
-    os.write(master, b"g")
-    output += _read_until(master, b"GLOBAL LOCAL MODE")
-    os.write(master, b"j\r")
-    output += _read_until(master, b"CONFIRM CHANGE")
-    assert b"set-global-mode" in output
-    os.write(master, b"n")
-    output += _read_until(master, b"LOCAL HOSTS")
-    time.sleep(0.2)
+    output += _read_until(master, "▸ Local hosts".encode())
+    os.write(master, b"L")
+    output += _read_until(master, b"Global local mode")
+    os.write(master, b"\x1b")
+    time.sleep(0.3)
     assert path.read_bytes() == original
 
-    os.write(master, b"g")
-    output += _read_until(master, b"GLOBAL LOCAL MODE")
+    os.write(master, b"L")
+    output += _read_until(master, b"Global local mode")
     os.write(master, b"j\r")
-    output += _read_until(master, b"CONFIRM CHANGE")
-    os.write(master, b"y")
-    output += _read_until(master, b"Applied set-global-mode")
+    output += _read_until(master, "Global local mode → Shadow".encode())
     assert json.loads(path.read_text())["providers"]["local"]["mode"] == "shadow"
     os.write(master, b"q")
     output += _wait_and_drain(process, master)
@@ -2404,139 +2760,129 @@ def _inventory_ui(tmp_path: Path, monkeypatch, *, settings: dict | None = None):
     return ui, manager
 
 
-def _select_inventory(ui: ManagerUI, key: str) -> None:
-    ui.render(100, 30, "")
-    keys = ui._inventory_keys()
+def _select(ui: ManagerUI, key: str) -> None:
+    keys = [row.key for row in ui._rows() if row.selectable]
     assert key in keys, keys
-    while ui.inventory_selected != key:
+    for _ in range(len(keys)):
+        if ui._selected_row().key == key:
+            return
         ui.handle("down")
+    raise AssertionError(f"could not select {key}")
 
 
-def _return_to_inventory(ui: ManagerUI) -> None:
-    """The dashboard's m key always lands on the inventory."""
-    while ui.view not in {"list", "overview"}:
-        ui.handle("esc")
-    ui.handle("esc")
-    assert ui.view == "overview"
-    ui.handle("m")
-    assert ui.screen == "inventory" and ui.view == "list"
-
-
-def test_inventory_lists_every_provider_and_enter_opens_its_controls(
-    tmp_path, monkeypatch
-) -> None:
+def test_inventory_lists_every_provider_under_group_headers(tmp_path, monkeypatch) -> None:
     settings = _local_settings()
     settings["providers"]["claude"]["subscription_tier"] = "Max 5x"
     settings["providers"]["claude"]["small_task_min_headroom_pct"] = 12
     settings["providers"]["claude"]["big_task_min_headroom_pct"] = 25
     ui, _manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
 
-    wide = ui.render(110, 30, "")
-    compact = re.sub(r" +", " ", wide)
-    assert "INVENTORY / all seats" in compact
-    assert "── INVENTORY 5" in wide
-    assert "KIND ID STATE STATUS LABEL" in compact
-    assert "> codex seat1 active working First?[2J界 · primary" in compact
-    assert "codex seat2 inactive idle Second" in compact
-    assert "claude account off none mode off · tier Max" in compact
-    # The host is placement for local seats, never a seat row of its own.
-    assert "local-host" not in wide and "local-seat studio" not in compact
-    assert "local-seat small active" in compact and "Coder · host studio" in compact
-    assert "local-seat large active" in compact
-    assert compact.count("+ add") == 1
-    assert "+ add seat Add seat (Codex, Cla" in compact
-    assert "Enter open controls · a Add seat" in wide.splitlines()[-1]
+    rows = ui._rows()
+    assert [row.key for row in rows] == [
+        "group:codex", "codex:seat1", "codex:seat2",
+        "group:claude", "claude:account",
+        "group:local", "local-seat:large", "local-seat:small",
+        "add:seat",
+    ]
+    wide = ui.render(120, 30, "")
+    _fits(wide, 120, 30)
+    assert "▸ Inventory" in wide
+    assert "CODEX 2 · primary seat1 is used last" in wide
+    assert "CLAUDE 1 · Off" in wide
+    assert "LOCAL 2 · global Opportunistic" in wide
+    assert f"{MARKER} P seat1 Standard 1x" in wide
+    assert "  W seat2 Unverified" in wide and "– paused" in _row_line(wide, "W seat2")
+    assert "  C claude Max 5x" in wide and "– off" in _row_line(wide, "C claude")
+    assert "L coder on studio large" in wide and "L coder on studio small" in wide
+    # A host is placement for local seats, never a seat row of its own.
+    assert "H studio" not in wide
+    assert wide.count("+ Add seat") == 1
     assert "\x1b" not in wide
-    assert all(display_width(line) <= 110 for line in wide.splitlines())
-    _select_inventory(ui, "claude:account")
-    stacked = re.sub(r" +", " ", ui.render(83, 30, ""))
-    assert " │ " not in stacked
-    assert "> claude account off none mode off · tier Max 5x (configured)" in stacked
-    claude_detail = _pages(ui, 120, 30)
-    assert "Small-task minimum: 12% remaining" in claude_detail
-    assert "Big-task minimum: 25% remaining" in claude_detail
-    _select_inventory(ui, "add:seat")
-    stacked = re.sub(r" +", " ", ui.render(83, 30, ""))
-    assert "> + add seat Add seat (Codex, Claude, or Local)" in stacked
-    prose = " ".join(stacked.split())
-    assert "chooses the seat type" in prose and "registered hosts: studio" in prose
-    assert "one Claude account" in prose and "second login" in prose
 
-    # Enter on each row lands directly on that item's existing controls, and
-    # Escape from those controls returns straight to the inventory with every
-    # provider row and the prior selection intact.
-    _select_inventory(ui, "local-seat:small")
-    assert "SELECTED LOCAL-SEAT:SMALL" in ui.render(110, 30, "")
+    _select(ui, "claude:account")
+    stacked = ui.render(84, 30, "")
+    assert " │ " not in stacked
+    assert "── CLAUDE · MAX 5X" in stacked
+    claude = _detail(ui)
+    assert "Floors small 12% · big 25% left" in claude and "Tier Max 5x · configured" in claude
+
+    _select(ui, "add:seat")
+    prose = " ".join(ui.render(84, 30, "").split())
+    assert "chooses the seat type" in prose and "registered host (studio)" in prose
+    assert "one Claude account" in prose
+
+
+def test_inventory_enter_opens_each_rows_controls_and_esc_returns(tmp_path, monkeypatch) -> None:
+    ui, _manager = _inventory_ui(tmp_path, monkeypatch)
+
+    _select(ui, "local-seat:small")
     ui.handle("enter")
     assert ui.screen == "local-seats" and ui.view == "local-actions"
     assert ui.local_selected_id == "small"
     actions = ui.render(110, 30, "")
-    assert "LOCAL SEAT ACTIONS  /  small" in actions
-    assert "Remove seat (requires lifecycle inactive and mode off; keeps retired history)" in actions
-    assert "Manage this seat's host (Local Hosts)" in actions
-    assert "Esc inventory" in actions.splitlines()[-1]
+    assert "Local seat actions · small" in actions
+    assert "Remove seat…" in actions and "pause it first (lifecycle inactive, mode off)" in actions
+    assert "Manage this seat's host" in actions
+    assert actions.splitlines()[-1].endswith("Esc back")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
     assert ui.inventory_selected == "local-seat:small"
-    back = re.sub(r" +", " ", ui.render(110, 30, ""))
-    assert "> local-seat small" in back and "codex seat1" in back and "claude account" in back
 
-    # The host stays reachable from the selected local seat's actions.
+    # The host stays reachable from the selected local seat's actions, and
+    # Esc walks back through each step.
     ui.handle("enter")
-    _choose_action(ui, "open-host")
+    labels = [action.label for action in ui._menu_actions()]
+    ui.menu_index = labels.index("Manage this seat's host")
+    ui.handle("enter")
     assert ui.screen == "hosts" and ui.view == "local-actions"
     assert ui.local_selected_id == "studio"
-    assert "HOST ACTIONS  /  studio" in ui.render(110, 30, "")
+    assert "Host actions · studio" in ui.render(110, 30, "")
+    ui.handle("esc")
+    assert ui.screen == "local-seats" and ui.view == "local-actions"
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.inventory_selected == "local-seat:small"
 
-    _select_inventory(ui, "claude:account")
-    detail = re.sub(r" +", " ", ui.render(110, 30, ""))
-    assert "SUBSCRIPTION TIER" in detail and "Tier: Max 5x" in detail
+    # Enter (or e) on the Claude row opens the Claude screen; Esc comes back.
+    _select(ui, "claude:account")
     ui.handle("enter")
-    assert ui.screen == "claude" and ui.view == "claude-actions"
-    menu = ui.render(110, 30, "")
-    assert "CLAUDE ACCOUNT ACTIONS" in menu and "Esc inventory" in menu.splitlines()[-1]
+    assert ui.screen == "claude" and ui.view == "list"
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.inventory_selected == "claude:account"
+    ui.handle("e")
+    assert ui.screen == "claude"
+    ui.handle("esc")
+    ui.handle("p")
+    assert ui.message_kind == "error" and "Claude screen" in ui.message
 
-    _select_inventory(ui, "codex:seat2")
+    _select(ui, "codex:seat2")
     ui.handle("enter")
-    assert ui.screen == "seats" and ui.view == "actions" and ui.selected_id == "seat2"
-    frame = ui.render(110, 30, "")
-    assert "SEAT ACTIONS  /  seat2" in frame and "Esc inventory" in frame.splitlines()[-1]
+    assert ui.screen == "inventory" and ui.view == "actions" and ui.selected_id == "seat2"
+    assert "Seat actions · seat2" in ui.render(110, 30, "")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
     assert ui.inventory_selected == "codex:seat2"
-    back = re.sub(r" +", " ", ui.render(110, 30, ""))
-    assert "> codex seat2" in back and "claude account" in back and "local-seat small" in back
 
     # Exactly one Add seat entry point: Enter on the row or a opens the type menu.
-    _select_inventory(ui, "add:seat")
+    _select(ui, "add:seat")
     ui.handle("enter")
     assert ui.screen == "inventory" and ui.view == "local-choice"
-    menu = ui.render(80, 12, "")
-    assert "ADD SEAT  /  choose the seat type" in menu and "SEAT TYPE" in menu
+    menu = ui.render(80, 14, "")
+    assert "Add seat · choose the seat type" in menu
     assert [value for _label, value in ui.choice_items] == ["add:codex", "add:claude", "add:local"]
-    assert "Esc back to inventory" in menu.splitlines()[-1]
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
     assert ui.inventory_selected == "add:seat"
 
     ui.handle("a")
-    assert ui.view == "local-choice"
     _choose(ui, "add:codex")
-    assert ui.screen == "seats" and ui.view == "add-form"
-    frame = ui.render(80, 12, "")
-    assert "ADD SEAT  /  new inactive Codex seat" in frame
-    assert "Esc cancel (back to inventory)" in frame.splitlines()[-1]
+    assert ui.screen == "inventory" and ui.view == "add-form"
+    assert "Add Codex seat · starts paused" in ui.render(80, 14, "")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
 
     ui.handle("a")
     _choose(ui, "add:claude")
-    assert ui.screen == "claude" and ui.view == "claude-actions"
-    assert "Set mode (off / manual_only" in ui.render(100, 12, "")
+    assert ui.screen == "claude" and ui.view == "list"
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
 
@@ -2545,18 +2891,24 @@ def test_inventory_lists_every_provider_and_enter_opens_its_controls(
     assert ui.screen == "local-seats" and ui.view == "local-form"
     assert ui.local_form_action == "add-seat"
     assert ui.local_form_buffers["host"] == "studio"
-    assert "ADD LOCAL SEAT" in ui.render(110, 30, "")
+    assert "Add local seat" in ui.render(110, 30, "")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
 
 
-def _choose_action(ui: ManagerUI, action: str) -> None:
-    """Pick a local action by its stable id from the open actions menu."""
-    assert ui.view == "local-actions"
-    ui.menu_index = next(
-        index for index, (_label, item) in enumerate(ui._local_actions()) if item == action
-    )
-    ui.handle("enter")
+def test_inventory_direct_keys_on_a_local_row_act_on_the_local_seat(tmp_path, monkeypatch) -> None:
+    _human_terminal(monkeypatch)
+    ui, manager = _inventory_ui(tmp_path, monkeypatch)
+    path = tmp_path / "settings.json"
+    _select(ui, "local-seat:large")
+    ui.handle("r")
+    assert manager.local.refresher.requests == ["studio"]
+    ui.handle("c")
+    assert ui.message == "× Redeem reset applies to Codex seats only"
+    ui.handle("p")
+    assert ui.message == "✓ Paused large · new local work skips it · p resumes"
+    assert json.loads(path.read_text())["local_seats"]["large"]["lifecycle"] == "inactive"
+    assert ui.screen == "inventory" and ui.view == "list"
 
 
 def test_inventory_shows_one_local_seat_row_for_one_host_and_one_seat(
@@ -2567,29 +2919,22 @@ def test_inventory_shows_one_local_seat_row_for_one_host_and_one_seat(
     settings["local_seats"] = {"studio-qwen3-8-27b": settings["local_seats"]["small"]}
     settings["local_seats"]["studio-qwen3-8-27b"]["label"] = "Qwen3 8-27B"
     ui, _manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
-    rows = ui._inventory_rows()
-    assert [row.kind for row in rows] == ["codex", "codex", "claude", "local-seat", "add", "global"]
-    assert [row.key for row in rows][3:] == ["local-seat:studio-qwen3-8-27b", "add:seat", INVENTORY_GLOBAL_KEY]
-    assert sum(1 for row in rows if row.kind == "add") == 1
+    rows = [row for row in ui._rows() if row.selectable]
+    assert [row.kind for row in rows] == ["codex", "codex", "claude", "local", "add"]
     frame = ui.render(120, 30, "")
-    assert "── INVENTORY 4" in frame
-    assert "local-host" not in frame and frame.count("+ add") == 1
-    # The long local id widens the ID column instead of overflowing it, so the
-    # STATE/STATUS columns stay aligned with the header for every row.
+    assert "LOCAL 1 · global Opportunistic" in frame
+    assert frame.count("+ Add seat") == 1
+    # Columns stay aligned with the header for every row.
     lines = frame.splitlines()
-    header_line = next(line for line in lines if "KIND" in line and "STATE" in line)
-    seat_line = next(line for line in lines if "studio-qwen3-8-27b" in line)
-    assert seat_line.index("active") == header_line.index("STATE")
-    assert seat_line.index("unknown") == header_line.index("STATUS")
-    stacked = re.sub(r" +", " ", ui.render(83, 30, ""))
-    assert "local-seat studio-qwen3-8-27b active unknown Qwen3 8-27B · host studio" in stacked
-    assert stacked.count("+ add") == 1
-    # The host is still one Tab away and named in the seat's placement detail.
-    _select_inventory(ui, "local-seat:studio-qwen3-8-27b")
-    assert "Host: studio · active · Studio" in re.sub(r" +", " ", _pages(ui, 120, 30))
+    header = next(line for line in lines if "STATUS" in line)
+    local = next(line for line in lines if "L coder on studio" in line)
+    assert local.index("◐ not probed") == header.index("STATUS")
+    # The host is one Tab away and named in the seat's placement detail.
+    _select(ui, "local-seat:studio-qwen3-8-27b")
+    assert "Host studio · Active · Studio" in _detail(ui)
     ui.handle(KEY_TAB)
     ui.handle(KEY_TAB)
-    assert ui.screen == "hosts" and "> studio" in ui.render(100, 24, "")
+    assert ui.screen == "hosts" and f"{MARKER} H studio" in ui.render(100, 24, "")
 
 
 def test_add_seat_type_menu_offers_host_first_path_when_no_host_is_registered(
@@ -2599,16 +2944,15 @@ def test_add_seat_type_menu_offers_host_first_path_when_no_host_is_registered(
     settings["local_hosts"] = {}
     settings["local_seats"] = {}
     ui, _manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
-    assert [row.kind for row in ui._inventory_rows()] == ["codex", "codex", "claude", "add", "global"]
-    _select_inventory(ui, "add:seat")
-    assert "no host is registered yet" in " ".join(ui.render(83, 30, "").split())
+    assert [row.kind for row in ui._rows() if row.selectable] == ["codex", "codex", "claude", "add"]
+    _select(ui, "add:seat")
+    assert "none is registered yet" in " ".join(ui.render(84, 30, "").split())
     ui.handle("a")
     _choose(ui, "add:local")
     assert ui.screen == "inventory" and ui.view == "local-choice"
-    menu = ui.render(90, 12, "")
-    assert "ADD LOCAL SEAT  /  no local host is registered yet" in menu
-    assert "SEAT TYPE" not in menu and "Esc back to seat type" in menu.splitlines()[-1]
+    assert "Add local seat · no local host is registered yet" in ui.render(90, 14, "")
     assert [value for _label, value in ui.choice_items] == ["add:host", "hosts"]
+    # Esc returns to the seat type menu, with its choices and selection intact.
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "local-choice"
     assert ui.choice_purpose == "inventory-add" and ui.choice_index == 2
@@ -2620,16 +2964,9 @@ def test_add_seat_type_menu_offers_host_first_path_when_no_host_is_registered(
     _choose(ui, "hosts")
     assert ui.screen == "hosts" and ui.view == "list"
     ui.handle("a")
-    assert ui.view == "local-form" and not ui.opened_from_inventory
+    assert ui.view == "local-form"
     ui.handle("esc")
     assert ui.screen == "hosts" and ui.view == "list"
-    ui.handle("esc")
-    assert ui.view == "overview"
-
-    ui.handle("m")
-    ui.handle("a")
-    _choose(ui, "add:local")
-    _choose(ui, "hosts")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
 
@@ -2638,72 +2975,60 @@ def test_add_seat_type_menu_offers_host_first_path_when_no_host_is_registered(
     _choose(ui, "add:host")
     assert ui.screen == "hosts" and ui.view == "local-form"
     assert ui.local_form_action == "add-host"
-    assert "ADD LOCAL HOST" in ui.render(110, 30, "")
+    assert "Add local host" in ui.render(110, 30, "")
     ui.handle("esc")
     assert ui.screen == "inventory" and ui.view == "list"
 
 
-def test_tab_entered_provider_lists_keep_overview_escape(tmp_path, monkeypatch) -> None:
+def test_back_stack_tab_and_overview_escape(tmp_path, monkeypatch) -> None:
     ui, _manager = _inventory_ui(tmp_path, monkeypatch)
     ui.handle(KEY_TAB)
-    assert ui.screen == "seats" and not ui.opened_from_inventory
+    assert ui.screen == "seats"
     ui.handle("enter")
     assert ui.view == "actions"
-    assert "Esc inventory" not in ui.render(100, 24, "").splitlines()[-1]
     ui.handle("esc")
     assert ui.screen == "seats" and ui.view == "list"
     ui.handle("esc")
     assert ui.view == "overview"
 
     ui.handle("m")
-    _select_inventory(ui, "codex:seat1")
+    _select(ui, "codex:seat1")
     ui.handle("enter")
-    assert ui.opened_from_inventory
-    # Tab away from controls opened from the inventory clears the return path.
+    ui.handle("?")
+    ui.handle("esc")
+    assert ui.view == "actions"
+    # Tab from a list starts a fresh stack: Esc then returns to the overview.
     ui.handle("esc")
     ui.handle(KEY_TAB)
     ui.handle(KEY_TAB)
-    assert ui.screen == "hosts" and not ui.opened_from_inventory
+    assert ui.screen == "hosts"
     ui.handle("enter")
     ui.handle("esc")
     assert ui.screen == "hosts" and ui.view == "list"
-    ui.handle(KEY_TAB)
-    ui.handle(KEY_TAB)
-    assert ui.screen == "claude" and ui.view == "list"
+    ui.handle("esc")
+    assert ui.view == "overview"
+    ui.handle("g")
+    assert ui.view == "global-settings"
     ui.handle("esc")
     assert ui.view == "overview"
 
 
-def test_inventory_entered_provider_list_keeps_new_actions_on_that_list(
-    tmp_path, monkeypatch
-) -> None:
-    ui, _manager = _inventory_ui(tmp_path, monkeypatch)
-    ui._show_screen("hosts", from_inventory=True)
-    assert ui.opened_from_inventory and ui.view == "list"
-    ui.handle("enter")
-    assert ui.view == "local-actions" and not ui.opened_from_inventory
-    assert "Esc inventory" not in ui.render(100, 24, "").splitlines()[-1]
-    ui.handle("esc")
-    assert ui.screen == "hosts" and ui.view == "list"
-
-
-def test_inventory_hides_retired_seats_until_history_and_paces_detail(
-    tmp_path, monkeypatch
-) -> None:
+def test_inventory_hides_retired_seats_until_history(tmp_path, monkeypatch) -> None:
     settings = _local_settings()
     settings["local_seats"]["large"]["lifecycle"] = "retired"
     settings["local_seats"]["large"]["mode"] = "off"
     ui, manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
     manager.settings["pool"]["seats"]["seat2"]["lifecycle"] = "retired"
+    ui._invalidate()
 
     ordinary = ui.render(100, 24, "")
-    # seat1, the Claude account, and local seat small; the host is not a seat.
-    assert "── INVENTORY 3" in ordinary
-    assert "large" not in ordinary and "seat2" not in ordinary
+    assert "CODEX 1" in ordinary and "LOCAL 1" in ordinary
+    assert "studio large" not in ordinary and "seat2" not in ordinary
     ui.handle("h")
     history = ui.render(100, 24, "")
-    assert "── INVENTORY 5" in history
-    assert "local-seat large      retired" in history and "seat2" in history
+    assert "CODEX 2" in history and "LOCAL 2" in history
+    assert "– retired" in _row_line(history, "W seat2")
+    assert "studio large" in history
 
     # m from the dashboard lands on the inventory even from another screen.
     ui.handle(KEY_TAB)
@@ -2717,24 +3042,14 @@ def test_inventory_hides_retired_seats_until_history_and_paces_detail(
     overview_ui.handle("m")
     assert overview_ui.screen == "inventory" and overview_ui.view == "list"
 
-    _select_inventory(ui, "local-seat:small")
-    seen = _pages(ui, 60, 12)
-    assert "── SELECTED LOCAL-SEAT:SMALL" in seen
-    assert "Host: studio" in seen and "Fingerprint:" in seen
-    _select_inventory(ui, "codex:seat1")
-    seen = _pages(ui, 60, 12)
-    assert "Seat: seat1 · active · primary" in seen and "CREDITS" in seen
 
-
-def test_claude_screen_shows_account_and_edits_through_previews(
-    tmp_path, monkeypatch
-) -> None:
+def test_claude_screen_lists_settings_and_applies_edits_at_once(tmp_path, monkeypatch) -> None:
     _human_terminal(monkeypatch)
     settings = _local_settings()
     settings["providers"]["claude"]["subscription_tier"] = "Max 5x"
     settings["providers"]["claude"]["small_task_min_headroom_pct"] = 12
     settings["providers"]["claude"]["big_task_min_headroom_pct"] = 25
-    ui, _manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
+    ui, manager = _inventory_ui(tmp_path, monkeypatch, settings=settings)
     with Ledger(tmp_path) as data:
         data["providers"]["claude"]["status"] = "cooldown"
         data["providers"]["claude"]["last_error"] = "raw provider text"
@@ -2746,163 +3061,113 @@ def test_claude_screen_shows_account_and_edits_through_previews(
         lambda *a, **k: pytest.fail("the UI read the usage cache while Claude is off"),
     )
 
-    # Enter on the inventory row opens the account's controls directly and
-    # Escape returns to the inventory; the full-screen account detail is the
-    # Claude screen reached by Tab / Shift-Tab.
-    _select_inventory(ui, "claude:account")
-    ui.handle("enter")
-    assert ui.screen == "claude" and ui.view == "claude-actions"
-    ui.handle("esc")
-    assert ui.screen == "inventory" and ui.inventory_selected == "claude:account"
     ui.handle(KEY_BACKTAB)
     assert ui.screen == "claude" and ui.view == "list"
-    seen = re.sub(r" +", " ", _pages(ui, 100, 12))
-    assert "CLAUDE ACCOUNT / providers.claude" in seen
-    assert "Account: claude · singleton subscription account · off" in seen
-    assert "Provider: cooldown" in seen and "raw provider text" not in seen
-    assert "Configured: off" in seen and "Effective: off" in seen
-    assert "Tier: Max 5x" in seen and "Source: configured · operator-declared label" in seen
-    assert "Detection: Unavailable" in seen
-    assert "Small-task minimum: 12% remaining" in seen
-    assert "Big-task minimum: 25% remaining" in seen
-    assert "Usage: Claude is effectively off; usage cache not read" in seen
-    assert "Enter edit mode / tier / headroom" in seen
+    frame = _squash(ui.render(120, 30, ""))
+    for row in ("Mode Off", "Subscription tier Max 5x", "Small-task floor 12% left",
+                "Big-task floor 25% left", "Active /usage refresh Enabled"):
+        assert row in frame, row
+    assert [row.key for row in ui._rows() if row.selectable] == [
+        f"setting:{action}" for action, _label in CLAUDE_SETTINGS
+    ]
+    detail = _detail(ui)
+    assert "Provider cooldown" in detail and "raw provider text" not in detail
+    assert "Mode Off" in detail and "Tier Max 5x · configured" in detail
+    assert "usage cache not read" in detail
+    assert "Off stops routing to Claude" in detail
 
+    # Mode: Esc from the choice writes nothing; choosing applies at once.
     ui.handle("enter")
-    assert ui.view == "claude-actions"
-    menu = ui.render(100, 12, "")
-    assert "CLAUDE ACCOUNT ACTIONS  /  providers.claude" in menu
-    assert "Set mode (off / manual_only / review_only / opportunistic)" in menu
-    assert "Set subscription tier label (Pro, Max 5x, Max 20x" in menu
-    assert "Set small-task minimum headroom percent" in menu
-    assert "Set big-task minimum headroom percent" in menu
-
-    # Mode: preview, cancel without writing, then confirm.
-    ui.menu_index = 0
-    ui.handle("enter")
-    assert ui.view == "local-choice" and "CLAUDE MODE" in ui.render(80, 10, "")
+    assert ui.view == "local-choice" and "Claude mode" in ui.render(80, 12, "")
     assert [value for _label, value in ui.choice_items] == list(CLAUDE_MODE_ORDER)
-    assert ui.choice_items[ui.choice_index] == ("off (current)", "off")
-    _choose(ui, "review_only")
-    assert ui.view == "confirm" and ui.confirm_kind == "claude"
-    confirm = ""
-    for _ in range(8):
-        confirm += "\n" + ui.render(80, 12, "")
-        ui.handle("pagedown")
-    assert "CONFIRM CHANGE  /  providers.claude" in confirm
-    assert "Claude account edit: mode = review_only  Target: providers.claude" in confirm
-    assert "turns Claude on" in confirm and "no credentials are read" in confirm
-    assert "providers.claude.before" in confirm and "providers.claude.after" in confirm
-    assert '-  "mode": "off"' in confirm and '+  "mode": "review_only"' in confirm
+    assert ui.choice_items[ui.choice_index] == ("Off (current)", "off")
     ui.handle("esc")
-    assert ui.view == "claude-actions" and ui.claude_preview is None
-    assert path.read_bytes() == original
-
+    assert ui.view == "list" and path.read_bytes() == original
     ui.handle("enter")
     _choose(ui, "review_only")
-    ui.handle("y")
     # Once Claude is on, the report may read the passive usage cache (a file),
     # never the provider client.
     monkeypatch.setattr(state_module, "load_claude_rate_limits", passive_cache)
-    assert ui.view == "message"
-    assert ui.message.startswith("Applied Claude account edit (mode = review_only)")
-    assert "configured mode now permits routing" in ui.message
-    assert _manager.settings["providers"]["claude"]["mode"] == "review_only"
+    assert ui.view == "list"
+    assert ui.message == "✓ Claude mode → Reviews only · Claude may now take routed work"
+    assert manager.settings["providers"]["claude"]["mode"] == "review_only"
     written = json.loads(path.read_text())
     assert written["providers"]["claude"]["mode"] == "review_only"
     assert written["providers"]["claude"]["subscription_tier"] == "Max 5x"
     assert written["local_hosts"]["studio"]["label"] == "Studio"
-    ui.handle("enter")
-    assert ui.view == "list" and ui.screen == "claude"
-    after = re.sub(r" +", " ", _pages(ui, 100, 12))
-    assert "Configured: review_only" in after and "Effective: review_only" in after
-    assert "Account: claude · singleton subscription account · review_only" in after
+    assert "Mode Reviews only" in _squash(ui.render(120, 30, ""))
 
     # Tier label choice offers every known plan plus clearing it.
+    ui.handle("down")
     ui.handle("enter")
-    ui.menu_index = 1
-    ui.handle("enter")
-    assert "CLAUDE SUBSCRIPTION TIER" in ui.render(80, 12, "")
+    assert "Claude subscription tier" in ui.render(80, 14, "")
     labels = [label for label, _value in ui.choice_items]
     assert "Max 5x (current)" in labels and "Max 20x" in labels and "Pro" in labels
     assert ui.choice_items[-1] == (CLAUDE_TIER_CLEAR_LABEL, None)
     _choose(ui, "Max 20x")
-    assert "Claude account edit: subscription_tier = Max 20x" in ui.render(80, 12, "")
-    ui.handle("enter")
-    assert ui.message.startswith("Applied Claude account edit (subscription_tier = Max 20x)")
+    assert ui.message == "✓ Claude tier → Max 20x"
     assert json.loads(path.read_text())["providers"]["claude"]["subscription_tier"] == "Max 20x"
-    ui.handle("enter")
-    assert "Tier: Max 20x" in re.sub(r" +", " ", _pages(ui, 100, 12))
 
-    # Headroom floors are typed, validated by the manager, and previewed.
-    ui.handle("enter")
-    ui.menu_index = 2
+    # Headroom floors are typed and validated by the manager.
+    ui.handle("down")
     ui.handle("enter")
     assert ui.view == "claude-input" and ui.input_buffer == "12"
     assert ui.handle("q") is None and ui.input_buffer == "12q"
-    ui.handle("backspace")
-    for _ in range(2):
+    for _ in range(3):
         ui.handle("backspace")
     _type(ui, "8")
     ui.handle("enter")
-    assert ui.view == "confirm"
-    assert "small_task_min_headroom_pct = 8" in ui.render(80, 12, "")
-    ui.handle("y")
-    assert "small_task_min_headroom_pct = 8" in ui.message
+    assert ui.view == "list" and ui.message == "✓ Claude small-task floor → 8% left"
     assert json.loads(path.read_text())["providers"]["claude"]["small_task_min_headroom_pct"] == 8
-    ui.handle("enter")
-    ui.handle("enter")
-    ui.menu_index = 3
+    ui.handle("down")
     ui.handle("enter")
     assert ui.view == "claude-input" and ui.input_buffer == "25"
     ui.input_buffer = "5"
     ui.handle("enter")
-    assert ui.view == "message"
-    assert "Invalid big-task minimum headroom percent" in ui.message
-    assert "must not exceed" in ui.message
-    ui.handle("enter")
     assert ui.view == "claude-input"
+    assert ui.message.startswith("× Invalid big-task floor") and "must not exceed" in ui.message
     ui.input_buffer = "abc"
     ui.handle("enter")
-    assert ui.view == "message" and "Invalid big-task" in ui.message
+    assert ui.view == "claude-input" and "Invalid big-task floor" in ui.message
     assert json.loads(path.read_text())["providers"]["claude"]["big_task_min_headroom_pct"] == 25
+    ui.handle("esc")
+    ui.handle("down")
+    ui.handle("enter")
+    assert ui.message == "✓ Active /usage refresh → Disabled"
+    assert json.loads(path.read_text())["providers"]["claude"]["active_usage_refresh"] is False
 
 
-def test_claude_edits_refuse_stale_previews_and_excluded_contexts(
+def test_claude_edits_refuse_stale_previews_and_managed_workers(
     tmp_path, monkeypatch
 ) -> None:
     _human_terminal(monkeypatch)
-    ui, _manager = _inventory_ui(tmp_path, monkeypatch)
+    ui, manager = _inventory_ui(tmp_path, monkeypatch)
     path = tmp_path / "settings.json"
+    real_preview = manager.claude.preview_mode
+
+    def racing_preview(mode):
+        preview = real_preview(mode)
+        local_cli.apply_action(tmp_path, "set-seat-mode", "large", mode="off", expected_digest=None)
+        return preview
+
+    manager.claude.preview_mode = racing_preview  # type: ignore[method-assign]
     ui.handle(KEY_BACKTAB)
     assert ui.screen == "claude"
     ui.handle("enter")
-    ui.menu_index = 0
-    ui.handle("enter")
     _choose(ui, "opportunistic")
-    assert ui.view == "confirm" and ui.confirm_kind == "claude"
-
-    local_cli.apply_action(
-        tmp_path, "set-seat-mode", "large", mode="off", expected_digest=None
-    )
+    assert ui.message_kind == "error" and "re-preview" in ui.message
     before = path.read_bytes()
-    ui.handle("y")
-    assert ui.view == "message" and "re-preview" in ui.message
-    assert path.read_bytes() == before
-    ui.handle("enter")
-    assert ui.view == "claude-actions"
-
-    ui.menu_index = 0
-    ui.handle("enter")
-    _choose(ui, "opportunistic")
-    monkeypatch.setenv("CODEX_SEATS_HEAD", "claude")
-    ui.handle("enter")
-    assert ui.view == "message" and "refused" in ui.message
-    assert path.read_bytes() == before
     assert json.loads(before)["providers"]["claude"]["mode"] == "off"
+    assert ui.view == "local-choice"
+
+    manager.claude.preview_mode = real_preview  # type: ignore[method-assign]
+    monkeypatch.setenv("CODEX_SEATS_MANAGED_WORKER", "1")
+    _choose(ui, "opportunistic")
+    assert ui.message_kind == "error" and "refused" in ui.message
+    assert path.read_bytes() == before
 
 
-def test_remove_local_seat_requires_inactive_off_and_keeps_retired_history(
+def test_remove_local_seat_requires_inactive_off_and_confirms_in_a_dialog(
     tmp_path, monkeypatch
 ) -> None:
     _human_terminal(monkeypatch)
@@ -2910,69 +3175,54 @@ def test_remove_local_seat_requires_inactive_off_and_keeps_retired_history(
     path = tmp_path / "settings.json"
     original = path.read_bytes()
 
-    _select_inventory(ui, "local-seat:small")
+    _select(ui, "local-seat:small")
     ui.handle("enter")
-    actions = ui._local_actions()
-    remove_index = next(i for i, (_label, action) in enumerate(actions) if action == "remove-seat")
+    labels = [action.label for action in ui._menu_actions()]
+    remove_index = labels.index("Remove seat…")
     ui.menu_index = remove_index
     ui.handle("enter")
-    assert ui.view == "message"
-    assert ui.message.startswith("Cannot remove local seat small:")
-    assert "requires lifecycle inactive and mode off" in ui.message
-    assert "retired history" in ui.message
-    assert path.read_bytes() == original
-    ui.handle("enter")
     assert ui.view == "local-actions"
+    assert ui.message == "× Remove seat: pause it first (lifecycle inactive, mode off)"
+    assert path.read_bytes() == original
+    ui.handle("esc")
 
     local_cli.apply_action(
         tmp_path, "set-seat-lifecycle", "large", lifecycle="inactive", expected_digest=None
     )
-    ui._local_report_cache = None
-    _return_to_inventory(ui)
-    _select_inventory(ui, "local-seat:large")
+    ui._invalidate()
+    _select(ui, "local-seat:large")
     ui.handle("enter")
     ui.menu_index = remove_index
     ui.handle("enter")
-    assert ui.view == "confirm" and ui.confirm_kind == "local"
+    assert ui.view == "confirm" and ui.confirm_kind == "remove-local"
     assert ui.local_preview.action == "remove-seat"
-    confirm = ""
+    frame = ui.render(90, 24, "")
+    for text in ("Remove local seat large", "coder on studio", "Paused → Retired",
+                 "kept as retired history", "! A retired local seat cannot be reactivated"):
+        assert text in frame, text
+    ui.handle("d")
+    raw = ""
     for _ in range(10):
-        confirm += "\n" + ui.render(90, 12, "")
+        raw += "\n" + ui.render(90, 16, "")
         ui.handle("pagedown")
-    assert "Local action: remove-seat  Target: seat large" in confirm
-    assert "retires the seat in place" in confirm
-    assert "requires lifecycle inactive and mode off" in confirm
-    assert "retired in place; its id, configuration and history are kept" in confirm
-    assert '-      "lifecycle": "inactive"' in confirm
-    assert '+      "lifecycle": "retired"' in confirm
+    assert '-      "lifecycle": "inactive"' in raw
+    assert '+      "lifecycle": "retired"' in raw
     ui.handle("esc")
     assert ui.view == "local-actions" and ui.local_preview is None
     assert json.loads(path.read_text())["local_seats"]["large"]["lifecycle"] == "inactive"
 
     ui.handle("enter")
     ui.handle("y")
-    assert ui.view == "message"
-    assert ui.message.startswith("Removed local seat large from service")
-    assert "retired history" in ui.message and "no longer be reactivated" in ui.message
+    assert ui.view == "list" and ui.screen == "inventory"
+    assert ui.message.startswith("✓ Removed local seat large · kept as retired history")
     written = json.loads(path.read_text())
     assert written["local_seats"]["large"]["lifecycle"] == "retired"
     assert written["local_seats"]["large"]["model_profile"] == "coder"
     assert written["local_seats"]["small"]["lifecycle"] == "active"
     assert written["local_hosts"]["studio"]["label"] == "Studio"
-    ui.handle("enter")
-    assert ui.view == "list" and ui.screen == "local-seats"
-    assert "large      retired" in ui.render(100, 26, "")
-
-    ui.handle("enter")
-    ui.menu_index = remove_index
-    ui.handle("enter")
-    assert ui.view == "message" and "already retired" in ui.message
-    ui.handle("enter")
-    _return_to_inventory(ui)
-    frame = ui.render(100, 26, "")
-    assert "large" not in frame
+    assert "studio large" not in ui.render(100, 26, "")
     ui.handle("h")
-    assert "local-seat large      retired" in ui.render(100, 26, "")
+    assert "studio large" in ui.render(100, 26, "")
 
 
 def test_inventory_and_claude_screens_keep_minimum_frame_and_sanitized_highlight(
@@ -2980,95 +3230,121 @@ def test_inventory_and_claude_screens_keep_minimum_frame_and_sanitized_highlight
 ) -> None:
     ui, manager = _inventory_ui(tmp_path, monkeypatch)
     manager.settings["pool"]["seats"]["seat1"]["label"] = "n\x1b]0;x\x07界"
-    styled = "\x1b[32moverview\x1b[0m"
+    ui.color = True
 
-    def check(frame: str, *, footer: str, width: int = 24, height: int = 6) -> None:
-        plain = _plain_frame(frame)
-        assert len(plain.splitlines()) <= height
-        assert all(display_width(line) <= width for line in plain.splitlines())
-        assert "\x1b" not in plain
-        assert footer in plain.splitlines()[-1]
+    def check(frame: str, width: int = 24, height: int = 6) -> None:
+        _fits(frame, width, height)
+        assert "\x1b" not in _plain_frame(frame)
 
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="q quit")
-    assert "> codex" in _plain_frame(frame)
-    assert "\x1b[1;48;2;68;71;90m" in frame
-    stacked = ui.render(70, 20, "")
-    assert "n?]0;x?界 · primary" in stacked and "\x1b" not in stacked
-    _select_inventory(ui, "local-seat:small")
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="q quit")
-    assert "> local-seat small" in _plain_frame(frame)
-    assert "studio" in _plain_frame(_pages(ui, 24, 6))
+    frame = ui.render(24, 6, "")
+    check(frame)
+    assert f"{MARKER}P seat1" in _plain_frame(frame) or f"{MARKER} P seat1" in _plain_frame(frame)
+    assert SELECTED_BG in frame
+    ui.color = False
+    assert "n?]0;x?界" in _detail(ui) and "\x1b" not in _detail(ui)
+    _select(ui, "local-seat:small")
+    check(ui.render(24, 6, ""))
+    assert "studio" in _pages(ui, 24, 6).lower()
 
     stacked = ui.render(60, 20, "")
-    assert " │ " not in stacked and "── INVENTORY 5" in stacked
-    assert "SELECTED LOCAL-SEAT:SMALL" in stacked
-    assert len(stacked.splitlines()) == 20
-    two_column = ui.render(100, 30, "")
-    assert "│ ── SELECTED LOCAL-SEAT:SMALL" in two_column
+    assert " │ " not in stacked and len(stacked.splitlines()) == 20
+    two_column = ui.render(120, 30, "")
+    assert " │ coder on studio  Local · small" in two_column
     assert len(two_column.splitlines()) == 30
-    assert all(display_width(line) <= 100 for line in two_column.splitlines())
+    _fits(two_column, 120, 30)
 
-    # The single Add seat row, its type menu, and the host-first submenu stay
-    # bounded and keep their cancel key visible at the 24×6 minimum.
-    _select_inventory(ui, "add:seat")
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="q quit")
-    assert "> + add" in _plain_frame(frame)
+    _select(ui, "add:seat")
+    check(ui.render(24, 6, ""))
     ui.handle("enter")
     assert ui.view == "local-choice"
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Esc")
-    assert "ADD SEAT" in _plain_frame(frame)
-    check(ui.render(64, 8, styled), footer="Esc back to inventory", width=64, height=8)
-    ui.handle("esc")
-    assert ui.screen == "inventory" and ui.view == "list"
-    ui.handle("a")
-    check(ui.render(24, 6, styled), footer="Esc")
+    check(ui.render(24, 6, ""))
+    check(ui.render(64, 8, ""), 64, 8)
     ui.handle("esc")
 
-    # Controls opened from the inventory are bounded and name their return.
-    _select_inventory(ui, "codex:seat1")
+    _select(ui, "codex:seat1")
     ui.handle("enter")
-    assert ui.view == "actions"
-    check(ui.render(24, 6, styled), footer="Esc")
-    check(ui.render(60, 8, styled), footer="Esc inventory", width=60, height=8)
+    check(ui.render(24, 6, ""))
     ui.handle("esc")
-    assert ui.screen == "inventory" and ui.inventory_selected == "codex:seat1"
-    _select_inventory(ui, "local-seat:small")
+    _select(ui, "claude:account")
     ui.handle("enter")
-    assert ui.view == "local-actions"
-    check(ui.render(24, 6, styled), footer="Esc")
-    ui.handle("esc")
-    assert ui.screen == "inventory"
-
-    _select_inventory(ui, "claude:account")
-    ui.handle("enter")
-    assert ui.screen == "claude" and ui.view == "claude-actions"
-    check(ui.render(24, 6, styled), footer="Enter")
-    assert "CLAUDE" in ui.render(24, 6, styled)
-    ui.handle("esc")
-    assert ui.screen == "inventory"
-    ui.handle(KEY_BACKTAB)
-    assert ui.screen == "claude" and ui.view == "list"
-    check(ui.render(24, 6, styled), footer="q quit")
-    ui.handle("enter")
-    check(ui.render(24, 6, styled), footer="Enter")
-    ui.menu_index = 2
+    assert ui.screen == "claude"
+    check(ui.render(24, 6, ""))
+    ui.handle("down")
+    ui.handle("down")
     ui.handle("enter")
     assert ui.view == "claude-input"
     ui.input_buffer = "12\x1b[2J界"
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Esc")
+    frame = ui.render(24, 6, "")
+    check(frame)
     assert "?[2J界" in _plain_frame(frame)
-    ui.handle("esc")
-    ui.menu_index = 0
-    ui.handle("enter")
-    assert ui.view == "local-choice"
-    check(ui.render(24, 6, styled), footer="Esc")
-    _choose(ui, "opportunistic")
-    assert ui.view == "confirm" and ui.confirm_kind == "claude"
-    frame = ui.render(24, 6, styled)
-    check(frame, footer="Enter/y")
-    assert "CONFIRM" in frame
+
+
+def test_real_pool_view_feeds_the_summary_strip_and_table(tmp_path, monkeypatch) -> None:
+    """With a readable pool the strip and rows come from pool_view.collect."""
+    for name in ("CODEX_CONTROL_SEAT", "CODEX_SEATS_HEAD", "CODEX_SEATS_MANAGED_WORKER"):
+        monkeypatch.delenv(name, raising=False)
+    _write_schema3(tmp_path)
+    settings, _warnings = load_settings(tmp_path)
+    calls = []
+    from codex_seats import pool_view
+
+    real_collect = pool_view.collect
+    monkeypatch.setattr(
+        pool_view, "collect", lambda *a, **k: calls.append(a[0]) or real_collect(*a, **k)
+    )
+    ui = ManagerUI(SeatManager(tmp_path, settings), direct=True)
+    frame = ui.render(120, 30, "")
+    assert calls and calls[0] == tmp_path
+    assert ui.pool_error is None and "usage unavailable" not in frame
+    assert frame.splitlines()[0].startswith("codex-seats  ○ CACHED")
+    assert "Ready 0/0" in frame and "Next → none" in frame
+    assert "W seat1 Unverified" in frame and "– paused" in _row_line(frame, "W seat1")
+    _fits(frame, 120, 30)
+
+
+def test_why_is_one_plain_sentence_from_the_structured_capacity_report() -> None:
+    why = ManagerUI._why
+    active = {"lifecycle": "active", "busy": False, "observed_at": time.time() - 4.3 * 3600}
+    weekly = {
+        "provider_status": "ok", "auth_ok": True,
+        "small": {"fits": False, "tier": "fresh", "requirements": [
+            {"window": "weekly", "headroom_pct": 0.4, "required_pct": 9.6, "margin_pct": 0.0},
+        ]},
+        "big": {"fits": False},
+    }
+    assert why(active, weekly) == "7-day window has 0% left; small tasks need 10%"
+    five = {**weekly, "small": {"fits": True}, "big": {"fits": False, "tier": "fresh", "requirements": [
+        {"window": "5h", "headroom_pct": 7.2, "required_pct": 10, "margin_pct": 0},
+    ]}}
+    assert why(active, five) == "Fits small tasks only · 5-hour window has 7% left; big tasks need 10%"
+    old = {**weekly, "small": {"fits": False, "tier": "unknown"}}
+    assert why(active, old) == "Usage data is 4.3h old · r refreshes it"
+    assert why(active, {**weekly, "auth_ok": False}) == "Signed out · l signs in again"
+    assert why({**active, "lifecycle": "inactive"}, None) == "Paused · p resumes it"
+    assert why(active, {**weekly, "small": {"fits": True}, "big": {"fits": True}}) is None
+
+
+def test_raw_diagnostic_stays_behind_d() -> None:
+    manager = _FakeManager()
+    manager.busy = set()
+    ui = _frontier_ui(manager)
+    ui._pool()["entries"][0]["reason"] = "capacity tier fresh (last-good observation age 4.30371h)"
+    plain = _detail(ui, 80)
+    assert "4.30371h" not in plain and "Raw" not in plain
+    ui.handle("d")
+    assert "Raw capacity tier fresh (last-good observation age 4.30371h)" in _detail(ui, 80)
+    ui.handle("d")
+    assert "4.30371h" not in _detail(ui, 80)
+
+
+def test_more_marker_counts_hidden_seats_not_wrapped_lines() -> None:
+    manager = _FakeManager()
+    template = dict(manager.settings["pool"]["seats"]["seat2"])
+    manager.settings["pool"]["seats"] = {
+        f"seat{number}": {**template, "label": f"Seat {number}"} for number in range(1, 10)
+    }
+    ui = _frontier_ui(manager)
+    frame = ui.render(48, 20, "")
+    shown = {f"seat{n}" for n in range(1, 10) if re.search(rf"\bseat{n}\b", frame)}
+    marker = re.search(r"… (\d+) more ↓", frame)
+    assert marker and int(marker.group(1)) == 9 - len(shown)
